@@ -213,7 +213,7 @@ function pagarme_capture($params)
                             'holder_name' => $holderName,
                             'exp_month'   => (int) substr($cardExpiry, 0, 2),
                             'exp_year'    => (int) ('20' . substr($cardExpiry, 2, 2)),
-                            'cvv'         => $params['cvv'],
+                            'cvv'         => $params['cccvv'],
                         ),
                     ),
                 ),
@@ -411,7 +411,7 @@ function pagarme_storeremote($params)
         'holder_name' => $holderName,
         'exp_month'   => (int) substr($cardExpiry, 0, 2),
         'exp_year'    => (int) ('20' . substr($cardExpiry, 2, 2)),
-        'cvv'         => $params['cvv'],
+        'cvv'         => $params['cccvv'],
     ));
 
     if ($card === false || empty($card['id'])) {

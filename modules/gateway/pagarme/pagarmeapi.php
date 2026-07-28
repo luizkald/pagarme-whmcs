@@ -23,7 +23,9 @@ class PagarmeApi
 
     public function __construct($secretKey)
     {
-        $this->secretKey = $secretKey;
+        // Remove espaços/quebras de linha acidentais (comum em copiar/colar),
+        // que corromperiam a autenticação HTTP Basic
+        $this->secretKey = trim((string) $secretKey);
     }
 
     // ---------------------------------------------------------------------
@@ -137,6 +139,7 @@ class PagarmeApi
             'Accept: application/json',
         ));
         // Basic Auth: Secret Key como usuário, senha em branco
+        curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
         curl_setopt($ch, CURLOPT_USERPWD, $this->secretKey . ':');
         curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
@@ -160,6 +163,16 @@ class PagarmeApi
         $decoded = json_decode($responseBody, true);
 
         if ($httpCode >= 400) {
+            // Erros de autenticação: mensagem orientativa sobre a Secret Key
+            if ($httpCode === 401 || $httpCode === 403) {
+                $original = isset($decoded['message']) ? $decoded['message'] : $responseBody;
+                $this->lastError = 'Autenticação recusada pela Pagar.me (HTTP ' . $httpCode . '). '
+                    . 'Verifique a Secret Key: ela deve começar com "sk_" (produção) ou "sk_test_" '
+                    . '(sandbox), sem espaços, e ser da API v5. Não use a chave pública (pk_) nem o '
+                    . 'ID da conta (acc_). Resposta original: ' . $original;
+                return false;
+            }
+
             if (isset($decoded['message'])) {
                 $this->lastError = $decoded['message'];
                 if (!empty($decoded['errors'])) {
