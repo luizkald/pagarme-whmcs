@@ -127,9 +127,19 @@ prefira uma solução via addon em vez de hook customizado.
 - **PCI-DSS**: como o cartão é digitado diretamente no seu site (sem tokenização
   client-side), seu ambiente precisa estar em conformidade com PCI-DSS — HTTPS
   obrigatório em toda a aplicação e nenhum dado de cartão em log ou banco.
-- **Parcelamento**: o módulo cobra à vista (1x). O campo "Parcelas Máximas" está
-  disponível na configuração, mas oferecer a escolha ao cliente exige customizar o
-  template de checkout do WHMCS para capturar a seleção e repassá-la ao campo
-  `installments` do payload.
+- **Parcelamento (até 5x sem juros)**: o módulo permite parcelar em até 5x SEM JUROS,
+  somente em faturas de planos anuais (configurável). Não há acréscimo de valor — a
+  cobrança é sempre igual ao total da fatura, apenas dividida, então não há impacto na
+  reconciliação da fatura. Para ativar:
+  1. Nas configurações do gateway, marque **"Parcelamento (até 5x sem juros)"** e, se
+     desejar restringir, **"Somente planos anuais"**.
+  2. Adicione o seletor de parcelas ao checkout do seu tema seguindo
+     `docs/seletor-parcelas-checkout.md`. Sem esse passo, o campo não chega ao módulo
+     e todas as cobranças ficam à vista.
+
+  O teto de 5x é fixo (constante `PAGARME_MAX_INSTALLMENTS`). A regra de "quando
+  parcelar" é aplicada no servidor: mesmo que o cliente veja o seletor, o módulo cobra
+  à vista se o parcelamento estiver desligado ou a fatura não for de plano anual.
+  Cobranças automáticas por cartão salvo (cron/recorrência) são sempre à vista.
 - **Antifraude**: pedidos que retornam `processing` ficam pendentes no WHMCS até a
   confirmação chegar pelo webhook.

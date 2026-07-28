@@ -69,12 +69,21 @@ function pagarme_config()
             'Size'         => '13',
             'Description'  => 'Texto exibido na fatura do cartão do cliente (máximo 13 caracteres)',
         ),
-        'maxInstallments' => array(
-            'FriendlyName' => 'Parcelas Máximas',
-            'Type'         => 'dropdown',
-            'Options'      => '1,2,3,4,5,6,7,8,9,10,11,12',
-            'Description'  => 'Número máximo de parcelas. Por padrão o módulo cobra à vista (1x); '
-                . 'oferecer a escolha ao cliente requer customização do template de checkout.',
+        'enableInstallments' => array(
+            'FriendlyName' => 'Parcelamento (até 5x sem juros)',
+            'Type'         => 'yesno',
+            'Description'  => 'Permite ao cliente parcelar em até 5x SEM JUROS. '
+                . 'Só é oferecido em faturas de planos anuais ou de ciclo maior '
+                . '(ver "Somente planos anuais" abaixo). O teto de 5x é fixo e '
+                . 'não há acréscimo de juros — o valor cobrado é igual ao total da fatura.',
+        ),
+        'installmentsAnnualOnly' => array(
+            'FriendlyName' => 'Somente planos anuais',
+            'Type'         => 'yesno',
+            'Default'      => 'on',
+            'Description'  => 'Quando marcado, o parcelamento só é oferecido se TODOS os itens '
+                . 'da fatura forem de ciclo anual ou maior (Annually, Biennially, Triennially). '
+                . 'Faturas mensais/trimestrais são cobradas somente à vista.',
         ),
         'cpfCustomField' => array(
             'FriendlyName' => 'Nome do Campo Personalizado (CPF/CNPJ)',
@@ -142,6 +151,13 @@ function pagarme_capture($params)
         'whmcs_invoice_id' => (string) $params['invoiceid'],
     );
 
+    // Número de parcelas (até 5x SEM JUROS). Como não há acréscimo de juros,
+    // o valor cobrado é sempre igual ao total da fatura - apenas dividido.
+    // Cobranças por token (cron/recorrência) são sempre à vista.
+    $installments = empty($params['gatewayid'])
+        ? pagarme_resolveInstallments($params)
+        : 1;
+
     if (!empty($params['gatewayid'])) {
         // --- Cenário 1: cobrança de cartão salvo (token) ---
         $token = pagarme_parseToken($params['gatewayid']);
@@ -163,7 +179,7 @@ function pagarme_capture($params)
                         'installments'         => 1,
                         'statement_descriptor' => $descriptor,
                         'card_id'              => $token['card_id'],
-                    ),
+                    ), // token: sempre à vista
                 ),
             ),
             'metadata' => $metadata,
@@ -190,7 +206,7 @@ function pagarme_capture($params)
                 array(
                     'payment_method' => 'credit_card',
                     'credit_card'    => array(
-                        'installments'         => 1,
+                        'installments'         => $installments,
                         'statement_descriptor' => $descriptor,
                         'card' => array(
                             'number'      => preg_replace('/\D/', '', $params['cardnum']),
@@ -501,6 +517,118 @@ function pagarme_buildCustomerPayload($params, $document, $holderName)
             'country'  => 'BR',
         ),
     );
+}
+
+/**
+ * Teto fixo de parcelas sem juros. Definido como constante porque, no modelo
+ * "sem juros", ultrapassar isso exigiria acréscimo no valor e reconciliação
+ * da fatura (fora do escopo atual).
+ */
+if (!defined('PAGARME_MAX_INSTALLMENTS')) {
+    define('PAGARME_MAX_INSTALLMENTS', 5);
+}
+
+/**
+ * Determina em quantas parcelas a cobrança deve ser feita.
+ *
+ * Regras:
+ *   - Parcelamento precisa estar habilitado na configuração.
+ *   - Se "Somente planos anuais" estiver marcado, a fatura inteira precisa ser
+ *     de ciclo anual ou maior.
+ *   - O cliente escolhe entre 1 e PAGARME_MAX_INSTALLMENTS (5) via seletor no
+ *     checkout (campo "pagarme_installments" no request).
+ *   - Qualquer valor inválido ou fora do intervalo cai para 1x (à vista).
+ *
+ * Não há juros: o valor cobrado é sempre o total da fatura, apenas dividido.
+ *
+ * @param array $params
+ * @return int
+ */
+function pagarme_resolveInstallments($params)
+{
+    // Parcelamento desabilitado -> à vista
+    if (empty($params['enableInstallments']) || $params['enableInstallments'] != 'on') {
+        return 1;
+    }
+
+    // Restrição a planos anuais
+    $annualOnly = !isset($params['installmentsAnnualOnly']) || $params['installmentsAnnualOnly'] == 'on';
+    if ($annualOnly && !pagarme_isInvoiceAnnual($params)) {
+        return 1;
+    }
+
+    // Valor escolhido pelo cliente no checkout
+    $selected = 1;
+    if (isset($_REQUEST['pagarme_installments'])) {
+        $selected = (int) $_REQUEST['pagarme_installments'];
+    }
+
+    if ($selected < 1) {
+        $selected = 1;
+    }
+    if ($selected > PAGARME_MAX_INSTALLMENTS) {
+        $selected = PAGARME_MAX_INSTALLMENTS;
+    }
+
+    return $selected;
+}
+
+/**
+ * Verifica se TODOS os itens da fatura pertencem a serviços de ciclo anual
+ * ou maior (Annually, Biennially, Triennially).
+ *
+ * Faturas sem itens de serviço identificáveis, ou com qualquer item de ciclo
+ * menor que anual, retornam false (parcelamento não liberado).
+ *
+ * @param array $params
+ * @return bool
+ */
+function pagarme_isInvoiceAnnual($params)
+{
+    if (!function_exists('localAPI') || empty($params['invoiceid'])) {
+        return false;
+    }
+
+    $ciclosAnuais = array('Annually', 'Biennially', 'Triennially');
+
+    $invoice = localAPI('GetInvoice', array('invoiceid' => $params['invoiceid']));
+
+    if (empty($invoice['items']['item'])) {
+        return false;
+    }
+
+    $items = $invoice['items']['item'];
+    // A API pode retornar um único item como array associativo simples
+    if (isset($items['id'])) {
+        $items = array($items);
+    }
+
+    $encontrouServico = false;
+
+    foreach ($items as $item) {
+        // Só nos interessam itens ligados a um serviço/produto (type "Hosting")
+        if (empty($item['type']) || strtolower($item['type']) !== 'hosting') {
+            continue;
+        }
+        if (empty($item['relid'])) {
+            continue;
+        }
+
+        $service = localAPI('GetClientsProducts', array('serviceid' => $item['relid']));
+
+        if (empty($service['products']['product'][0]['billingcycle'])) {
+            return false;
+        }
+
+        $cycle = $service['products']['product'][0]['billingcycle'];
+        if (!in_array($cycle, $ciclosAnuais, true)) {
+            return false; // achou um item não-anual -> bloqueia parcelamento
+        }
+
+        $encontrouServico = true;
+    }
+
+    return $encontrouServico;
 }
 
 /**
