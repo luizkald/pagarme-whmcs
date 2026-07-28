@@ -213,7 +213,7 @@ function pagarme_capture($params)
                             'holder_name' => $holderName,
                             'exp_month'   => (int) substr($cardExpiry, 0, 2),
                             'exp_year'    => (int) ('20' . substr($cardExpiry, 2, 2)),
-                            'cvv'         => $params['cccvv'],
+                            'cvv'         => pagarme_getCvv($params),
                         ),
                     ),
                 ),
@@ -370,6 +370,14 @@ function pagarme_storeremote($params)
         );
     }
 
+    // O WHMCS informa a operação desejada em $params['action']:
+    // create (novo cartão), update (substituir) ou delete (remover).
+    $action = isset($params['action']) ? $params['action'] : 'create';
+
+    if ($action === 'delete') {
+        return pagarme_removeremote($params);
+    }
+
     $document = pagarme_getCustomerDocument($params);
 
     if (empty($document)) {
@@ -405,13 +413,25 @@ function pagarme_storeremote($params)
 
     // 2. Salva o cartão vinculado a esse cliente
     $cardExpiry = (string) $params['cardexp']; // formato MMYY
+    $cvv        = pagarme_getCvv($params);
+
+    if ($cvv === '') {
+        $reason = 'CVV não disponível nesta operação. A Pagar.me exige o CVV para salvar '
+            . 'um cartão, mas o WHMCS não o fornece em atualizações automáticas. '
+            . 'Peça ao cliente para cadastrar o cartão novamente informando o código de segurança.';
+        pagarme_log($params, array('action' => $action), 'storeremote: CVV indisponível');
+        return array(
+            'status'  => 'declined',
+            'rawdata' => $reason,
+        );
+    }
 
     $card = $api->createCard($customer['id'], array(
         'number'      => preg_replace('/\D/', '', $params['cardnum']),
         'holder_name' => $holderName,
         'exp_month'   => (int) substr($cardExpiry, 0, 2),
         'exp_year'    => (int) ('20' . substr($cardExpiry, 2, 2)),
-        'cvv'         => $params['cccvv'],
+        'cvv'         => $cvv,
     ));
 
     if ($card === false || empty($card['id'])) {
@@ -683,6 +703,42 @@ function pagarme_isInvoiceAnnual($params)
     }
 
     return $encontrouServico;
+}
+
+/**
+ * Obtém o CVV do cartão.
+ *
+ * O WHMCS não inclui o CVV nos parâmetros passados para storeremote (por
+ * conformidade PCI-DSS, o CVV não pode ser armazenado), mas a Pagar.me exige
+ * o CVV para criar um cartão salvo. Por isso buscamos também no POST da
+ * requisição atual, onde o valor existe em memória enquanto o cliente submete
+ * o formulário.
+ *
+ * O CVV é usado apenas nesta requisição e nunca é armazenado ou logado.
+ *
+ * @param array $params
+ * @return string CVV apenas com dígitos, ou string vazia se indisponível
+ */
+function pagarme_getCvv($params)
+{
+    // 1) Parâmetro do módulo (presente no capture)
+    if (!empty($params['cccvv'])) {
+        return preg_replace('/\D/', '', $params['cccvv']);
+    }
+
+    // 2) POST do formulário atual (necessário no storeremote)
+    $chaves = array('cccvv', 'cvv', 'ccv', 'cardcvv', 'card_cvv');
+
+    foreach ($chaves as $chave) {
+        if (!empty($_POST[$chave])) {
+            return preg_replace('/\D/', '', $_POST[$chave]);
+        }
+        if (!empty($_REQUEST[$chave])) {
+            return preg_replace('/\D/', '', $_REQUEST[$chave]);
+        }
+    }
+
+    return '';
 }
 
 /**
