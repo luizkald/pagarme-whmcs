@@ -133,7 +133,11 @@ prefira uma solução via addon em vez de hook customizado.
   reconciliação da fatura. Para ativar:
   1. Nas configurações do gateway, marque **"Parcelamento (até 5x sem juros)"** e, se
      desejar restringir, **"Somente planos anuais"**.
-  2. Adicione o seletor de parcelas ao checkout do seu tema seguindo
+  2. Adicione o seletor de parcelas ao checkout. Em temas que sobrescrevem os
+     templates padrão (ex.: **Lagom / Smart Order Form**), use o hook pronto:
+     copie `includes/hooks/pagarme_installments_selector.php` para `/includes/hooks/`.
+     Ele injeta o seletor via JavaScript, sem editar templates, e sobrevive a
+     atualizações do tema. Detalhes e a alternativa manual em
      `docs/seletor-parcelas-checkout.md`. Sem esse passo, o campo não chega ao módulo
      e todas as cobranças ficam à vista.
 

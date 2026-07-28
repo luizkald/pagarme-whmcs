@@ -632,27 +632,66 @@ function pagarme_isInvoiceAnnual($params)
 }
 
 /**
- * Busca o CPF/CNPJ do cliente no Custom Client Field configurado
+ * Busca o CPF/CNPJ do cliente no Custom Client Field configurado.
+ *
+ * Consulta direto as tabelas de custom fields via Capsule, o que é
+ * independente da versão do WHMCS (a resposta da API GetClientsDetails
+ * varia entre string e array conforme a versão).
  *
  * @param array $params
  * @return string|null Documento apenas com dígitos, ou null se não encontrado
  */
 function pagarme_getCustomerDocument($params)
 {
-    if (!function_exists('localAPI')) {
-        return null;
-    }
-
-    $fieldName = !empty($params['cpfCustomField']) ? $params['cpfCustomField'] : 'CPF/CNPJ';
+    $fieldName = !empty($params['cpfCustomField']) ? trim($params['cpfCustomField']) : 'CPF/CNPJ';
 
     $clientId = null;
     if (!empty($params['clientdetails']['userid'])) {
-        $clientId = $params['clientdetails']['userid'];
+        $clientId = (int) $params['clientdetails']['userid'];
     } elseif (!empty($params['userid'])) {
-        $clientId = $params['userid'];
+        $clientId = (int) $params['userid'];
     }
 
     if (!$clientId) {
+        return null;
+    }
+
+    // Caminho principal: consulta ao banco via Capsule (mais confiável)
+    if (class_exists('\WHMCS\Database\Capsule')) {
+        try {
+            $query = \WHMCS\Database\Capsule::table('tblcustomfieldsvalues')
+                ->join(
+                    'tblcustomfields',
+                    'tblcustomfields.id',
+                    '=',
+                    'tblcustomfieldsvalues.fieldid'
+                )
+                ->where('tblcustomfields.type', 'client')
+                ->where('tblcustomfieldsvalues.relid', $clientId);
+
+            // Tenta correspondência exata do nome do campo; se não achar,
+            // tenta uma correspondência parcial (LIKE) como tolerância.
+            $value = (clone $query)
+                ->where('tblcustomfields.fieldname', $fieldName)
+                ->value('tblcustomfieldsvalues.value');
+
+            if ($value === null) {
+                $value = (clone $query)
+                    ->where('tblcustomfields.fieldname', 'like', '%' . $fieldName . '%')
+                    ->value('tblcustomfieldsvalues.value');
+            }
+
+            if (!empty($value)) {
+                $digits = preg_replace('/\D/', '', $value);
+                return $digits !== '' ? $digits : null;
+            }
+        } catch (\Exception $e) {
+            // Em caso de erro no banco, cai para o fallback via API abaixo
+        }
+    }
+
+    // Fallback: API GetClientsDetails, tolerando resposta em array OU string
+    if (!function_exists('localAPI')) {
         return null;
     }
 
@@ -665,8 +704,34 @@ function pagarme_getCustomerDocument($params)
         return null;
     }
 
-    // O retorno vem como string, uma linha por campo, no formato "Campo|Valor"
-    foreach (explode("\n", $result['customfields']) as $line) {
+    $custom = $result['customfields'];
+
+    // Formato mais novo: array de itens (['id'=>, 'value'=>] etc.)
+    if (is_array($custom)) {
+        foreach ($custom as $field) {
+            if (!is_array($field)) {
+                continue;
+            }
+
+            $name = '';
+            foreach (array('translated_fieldname', 'fieldname', 'name') as $key) {
+                if (!empty($field[$key])) {
+                    $name = $field[$key];
+                    break;
+                }
+            }
+
+            if ($name !== '' && stripos($name, $fieldName) !== false && isset($field['value'])) {
+                $digits = preg_replace('/\D/', '', $field['value']);
+                return $digits !== '' ? $digits : null;
+            }
+        }
+
+        return null;
+    }
+
+    // Formato antigo: string com linhas "Campo|Valor"
+    foreach (explode("\n", (string) $custom) as $line) {
         if (stripos($line, $fieldName) !== false) {
             $parts = explode('|', $line, 2);
             if (isset($parts[1])) {

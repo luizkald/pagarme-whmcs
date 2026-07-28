@@ -1,17 +1,32 @@
 # Seletor de parcelas no checkout
 
 O módulo lê a parcela escolhida pelo cliente a partir do campo `pagarme_installments`
-enviado no request da tela de pagamento. Para que esse campo exista, é preciso
-adicioná-lo ao formulário de cartão de crédito do seu tema.
+enviado no request da tela de pagamento. Para que esse campo exista, ele precisa ser
+adicionado ao formulário de cartão de crédito.
 
 O teto é fixo em **5x** e **sem juros** — o valor cobrado é sempre igual ao total da
 fatura, apenas dividido.
 
-## Opção A (recomendada): adicionar o seletor via arquivo do tema
+## Opção A (RECOMENDADA): hook — funciona em qualquer tema, inclusive Lagom
 
-No seu tema (ex.: `templates/six/`), localize o template do formulário de cartão de
-crédito — normalmente `creditcard.tpl` (ou o bloco de pagamento em `viewinvoice.tpl`).
-Adicione o `<select>` abaixo dentro do formulário de pagamento:
+Basta copiar `includes/hooks/pagarme_installments_selector.php` para a pasta
+`/includes/hooks/` na raiz do WHMCS. Pronto — não precisa editar nenhum template.
+
+Esse é o método recomendado **especialmente para temas como o Lagom (RS Studio) /
+Smart Order Form**, que sobrescrevem os templates padrão do WHMCS. Editar os arquivos
+desses temas diretamente é frágil: as alterações são perdidas na próxima atualização
+do tema. O hook injeta o seletor via JavaScript, localizando o campo padrão de cartão
+(`input[name="ccnumber"]`) e inserindo o `<select>` dentro do mesmo formulário, então
+o valor é enviado normalmente na submissão. Ele também usa MutationObserver, o que o
+torna compatível com o checkout em AJAX do Lagom.
+
+Se quiser mudar o rótulo das opções ou o texto de ajuda, edite o próprio hook.
+
+## Opção B: adicionar o seletor manualmente via arquivo do tema
+
+Se preferir controlar o HTML diretamente (temas padrão como o Six), localize o
+template do formulário de cartão — normalmente `creditcard.tpl` (ou o bloco de
+pagamento em `viewinvoice.tpl`) — e adicione o `<select>` abaixo dentro do formulário:
 
 ```html
 <div class="form-group" id="pagarme-installments-wrapper">
