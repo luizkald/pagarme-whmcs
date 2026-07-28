@@ -141,6 +141,9 @@ function pagarme_capture($params)
 
     $items = array(
         array(
+            // 'code' é obrigatório na API v5 da Pagar.me: identifica o item
+            // no sistema de origem. Usamos o ID da fatura do WHMCS.
+            'code'        => 'INV' . $params['invoiceid'],
             'amount'      => $amountCents,
             'description' => pagarme_getDescription($params),
             'quantity'    => 1,
