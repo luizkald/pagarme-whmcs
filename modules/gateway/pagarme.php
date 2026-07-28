@@ -225,6 +225,7 @@ function pagarme_capture($params)
     $response = $api->createOrder($payload);
 
     if ($response === false) {
+        pagarme_log($params, $api->getLastError(), 'capture: falha na comunicação/validação');
         return array(
             'status'  => 'declined',
             'rawdata' => $api->getLastError(),
@@ -234,6 +235,7 @@ function pagarme_capture($params)
     $charge = isset($response['charges'][0]) ? $response['charges'][0] : null;
 
     if (!$charge || empty($charge['status'])) {
+        pagarme_log($params, $response, 'capture: resposta sem cobrança válida');
         return array(
             'status'  => 'declined',
             'rawdata' => $response,
@@ -242,6 +244,11 @@ function pagarme_capture($params)
 
     switch ($charge['status']) {
         case 'paid':
+            pagarme_log($params, array(
+                'charge_id'    => $charge['id'],
+                'order_id'     => $response['id'],
+                'installments' => $installments,
+            ), 'capture: pago');
             return array(
                 'status'  => 'success',
                 'transid' => $charge['id'],
@@ -253,6 +260,7 @@ function pagarme_capture($params)
         case 'pending':
             // Em análise antifraude. A confirmação chega depois via webhook
             // (order.paid / order.payment_failed), tratado em callback/pagarme.php
+            pagarme_log($params, array('charge_id' => $charge['id']), 'capture: em análise (pending)');
             return array(
                 'status'  => 'pending',
                 'transid' => $charge['id'],
@@ -260,11 +268,40 @@ function pagarme_capture($params)
             );
 
         default:
+            // Extrai um motivo legível da recusa quando disponível
+            $motivo = pagarme_extractDeclineReason($charge);
+            pagarme_log($params, $response, 'capture: recusado (' . $charge['status'] . ') ' . $motivo);
             return array(
                 'status'  => 'declined',
                 'rawdata' => $response,
             );
     }
+}
+
+/**
+ * Extrai uma mensagem legível de recusa a partir da última transação da cobrança.
+ *
+ * @param array $charge
+ * @return string
+ */
+function pagarme_extractDeclineReason($charge)
+{
+    if (empty($charge['last_transaction'])) {
+        return '';
+    }
+
+    $lt = $charge['last_transaction'];
+
+    foreach (array('acquirer_message', 'gateway_response', 'status') as $key) {
+        if (!empty($lt[$key])) {
+            if (is_array($lt[$key])) {
+                return json_encode($lt[$key]);
+            }
+            return (string) $lt[$key];
+        }
+    }
+
+    return '';
 }
 
 /**
@@ -336,10 +373,16 @@ function pagarme_storeremote($params)
     $document = pagarme_getCustomerDocument($params);
 
     if (empty($document)) {
+        $reason = 'CPF/CNPJ do cliente não encontrado. Cadastre um Custom Client Field '
+            . 'com o CPF/CNPJ e informe o nome dele nas configurações do gateway, '
+            . 'ou preencha o Tax ID do cliente.';
+        pagarme_log($params, array(
+            'clientid'  => isset($params['clientdetails']['userid']) ? $params['clientdetails']['userid'] : null,
+            'fieldName' => isset($params['cpfCustomField']) ? $params['cpfCustomField'] : null,
+        ), 'storeremote: ' . $reason);
         return array(
             'status'  => 'declined',
-            'rawdata' => 'CPF/CNPJ do cliente não encontrado. Cadastre um Custom Client Field '
-                . 'com o CPF/CNPJ e informe o nome dele nas configurações do gateway.',
+            'rawdata' => $reason,
         );
     }
 
@@ -352,9 +395,11 @@ function pagarme_storeremote($params)
     );
 
     if ($customer === false || empty($customer['id'])) {
+        $err = $api->getLastError() ?: 'Não foi possível criar o cliente na Pagar.me.';
+        pagarme_log($params, $err, 'storeremote: falha ao criar cliente');
         return array(
             'status'  => 'declined',
-            'rawdata' => $api->getLastError() ?: 'Não foi possível criar o cliente na Pagar.me.',
+            'rawdata' => $err,
         );
     }
 
@@ -370,11 +415,20 @@ function pagarme_storeremote($params)
     ));
 
     if ($card === false || empty($card['id'])) {
+        $err = $api->getLastError() ?: 'Não foi possível salvar o cartão na Pagar.me.';
+        pagarme_log($params, $err, 'storeremote: falha ao salvar cartão');
         return array(
             'status'  => 'declined',
-            'rawdata' => $api->getLastError() ?: 'Não foi possível salvar o cartão na Pagar.me.',
+            'rawdata' => $err,
         );
     }
+
+    pagarme_log($params, array(
+        'customer_id'      => $customer['id'],
+        'card_id'          => $card['id'],
+        'brand'            => isset($card['brand']) ? $card['brand'] : '',
+        'last_four_digits' => isset($card['last_four_digits']) ? $card['last_four_digits'] : '',
+    ), 'storeremote: cartão salvo com sucesso');
 
     return array(
         'status'    => 'success',
@@ -632,6 +686,37 @@ function pagarme_isInvoiceAnnual($params)
 }
 
 /**
+ * Registra uma entrada no Gateway Log do WHMCS de forma segura.
+ *
+ * NUNCA registra número de cartão ou CVV - apenas respostas da Pagar.me
+ * (que trazem no máximo os 4 últimos dígitos) e mensagens de erro.
+ *
+ * @param array        $params Parâmetros do gateway (para descobrir o nome)
+ * @param mixed        $data   Dados a registrar (resposta da API, texto, etc.)
+ * @param string       $result Rótulo do resultado (ex: "storeremote: sucesso")
+ * @return void
+ */
+function pagarme_log($params, $data, $result)
+{
+    if (!function_exists('logTransaction')) {
+        return;
+    }
+
+    $name = 'pagarme';
+    if (!empty($params['name'])) {
+        $name = $params['name'];
+    } elseif (!empty($params['paymentmethod'])) {
+        $name = $params['paymentmethod'];
+    }
+
+    try {
+        logTransaction($name, $data, $result);
+    } catch (\Exception $e) {
+        // Log é auxiliar; nunca deve interromper o fluxo de pagamento
+    }
+}
+
+/**
  * Busca o CPF/CNPJ do cliente no Custom Client Field configurado.
  *
  * Consulta direto as tabelas de custom fields via Capsule, o que é
@@ -656,41 +741,91 @@ function pagarme_getCustomerDocument($params)
         return null;
     }
 
-    // Caminho principal: consulta ao banco via Capsule (mais confiável)
-    if (class_exists('\WHMCS\Database\Capsule')) {
+    // 1) Campo personalizado, via banco (Capsule) - mais confiável
+    $value = pagarme_lookupCustomFieldDb($clientId, $fieldName);
+
+    // 2) Campo personalizado, via API (fallback, tolera array OU string)
+    if ($value === null) {
+        $value = pagarme_lookupCustomFieldApi($clientId, $fieldName);
+    }
+
+    // 3) Fallback: campo nativo Tax ID / VAT do cliente
+    //    (muitos WHMCS no Brasil guardam o CPF/CNPJ ali)
+    if ($value === null && !empty($params['clientdetails']['tax_id'])) {
+        $value = $params['clientdetails']['tax_id'];
+    }
+    if ($value === null && class_exists('\WHMCS\Database\Capsule')) {
         try {
-            $query = \WHMCS\Database\Capsule::table('tblcustomfieldsvalues')
-                ->join(
-                    'tblcustomfields',
-                    'tblcustomfields.id',
-                    '=',
-                    'tblcustomfieldsvalues.fieldid'
-                )
-                ->where('tblcustomfields.type', 'client')
-                ->where('tblcustomfieldsvalues.relid', $clientId);
-
-            // Tenta correspondência exata do nome do campo; se não achar,
-            // tenta uma correspondência parcial (LIKE) como tolerância.
-            $value = (clone $query)
-                ->where('tblcustomfields.fieldname', $fieldName)
-                ->value('tblcustomfieldsvalues.value');
-
-            if ($value === null) {
-                $value = (clone $query)
-                    ->where('tblcustomfields.fieldname', 'like', '%' . $fieldName . '%')
-                    ->value('tblcustomfieldsvalues.value');
-            }
-
-            if (!empty($value)) {
-                $digits = preg_replace('/\D/', '', $value);
-                return $digits !== '' ? $digits : null;
+            $taxId = \WHMCS\Database\Capsule::table('tblclients')
+                ->where('id', $clientId)
+                ->value('tax_id');
+            if (!empty($taxId)) {
+                $value = $taxId;
             }
         } catch (\Exception $e) {
-            // Em caso de erro no banco, cai para o fallback via API abaixo
+            // ignora e segue
         }
     }
 
-    // Fallback: API GetClientsDetails, tolerando resposta em array OU string
+    if ($value === null) {
+        return null;
+    }
+
+    $digits = preg_replace('/\D/', '', $value);
+    return $digits !== '' ? $digits : null;
+}
+
+/**
+ * Busca o valor de um campo personalizado de cliente direto no banco.
+ *
+ * @param int    $clientId
+ * @param string $fieldName
+ * @return string|null
+ */
+function pagarme_lookupCustomFieldDb($clientId, $fieldName)
+{
+    if (!class_exists('\WHMCS\Database\Capsule')) {
+        return null;
+    }
+
+    try {
+        $query = \WHMCS\Database\Capsule::table('tblcustomfieldsvalues')
+            ->join(
+                'tblcustomfields',
+                'tblcustomfields.id',
+                '=',
+                'tblcustomfieldsvalues.fieldid'
+            )
+            ->where('tblcustomfields.type', 'client')
+            ->where('tblcustomfieldsvalues.relid', $clientId);
+
+        // Correspondência exata; se falhar, tenta parcial (LIKE)
+        $value = (clone $query)
+            ->where('tblcustomfields.fieldname', $fieldName)
+            ->value('tblcustomfieldsvalues.value');
+
+        if ($value === null) {
+            $value = (clone $query)
+                ->where('tblcustomfields.fieldname', 'like', '%' . $fieldName . '%')
+                ->value('tblcustomfieldsvalues.value');
+        }
+
+        return !empty($value) ? $value : null;
+    } catch (\Exception $e) {
+        return null;
+    }
+}
+
+/**
+ * Busca o valor de um campo personalizado de cliente via API GetClientsDetails,
+ * tolerando resposta em array (WHMCS novo) ou string (WHMCS antigo).
+ *
+ * @param int    $clientId
+ * @param string $fieldName
+ * @return string|null
+ */
+function pagarme_lookupCustomFieldApi($clientId, $fieldName)
+{
     if (!function_exists('localAPI')) {
         return null;
     }
@@ -721,9 +856,8 @@ function pagarme_getCustomerDocument($params)
                 }
             }
 
-            if ($name !== '' && stripos($name, $fieldName) !== false && isset($field['value'])) {
-                $digits = preg_replace('/\D/', '', $field['value']);
-                return $digits !== '' ? $digits : null;
+            if ($name !== '' && stripos($name, $fieldName) !== false && !empty($field['value'])) {
+                return $field['value'];
             }
         }
 
@@ -734,9 +868,8 @@ function pagarme_getCustomerDocument($params)
     foreach (explode("\n", (string) $custom) as $line) {
         if (stripos($line, $fieldName) !== false) {
             $parts = explode('|', $line, 2);
-            if (isset($parts[1])) {
-                $digits = preg_replace('/\D/', '', $parts[1]);
-                return $digits !== '' ? $digits : null;
+            if (isset($parts[1]) && trim($parts[1]) !== '') {
+                return $parts[1];
             }
         }
     }
