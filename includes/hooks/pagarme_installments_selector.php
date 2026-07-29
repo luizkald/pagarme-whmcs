@@ -169,8 +169,12 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
     function isPagarmeSelected(){
         var radio=document.querySelector('input[name="payment_method"][value="'+GATEWAY_KEY+'"], input[name="paymentmethod"][value="'+GATEWAY_KEY+'"]');
         if(radio) return radio.checked;
-        // fallback: se há campos de cartão visíveis e nosso select já existe
-        return !!document.getElementById('pagarme_installments') || !!document.querySelector('input[name="ccnumber"]');
+        // Na tela de pagamento da fatura (Caixa) não há radio de gateway; a
+        // presença dos cartões salvos da Pagar.me (name="pagarme") ou do painel
+        // do gateway indica que a Pagar.me é o gateway ativo.
+        if(document.querySelector('input[name="'+GATEWAY_KEY+'"]')) return true;
+        if(document.querySelector('#mg-gateway-form-'+GATEWAY_KEY)) return true;
+        return false;
     }
 
     function maxAllowed(){
@@ -251,12 +255,20 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
     }
 
     function findContainer(){
-        // Tenta painel específico do gateway; senão, o form do cartão/fatura
+        // Painel do gateway no order form
         var panel=document.querySelector('#mg-gateway-form-'+GATEWAY_KEY);
         if(panel && panel.offsetParent!==null) return panel;
+        // Cartão novo digitado
         var cc=document.querySelector('input[name="ccnumber"]');
         if(cc){ var g=cc.closest('.form-group')||cc.parentNode; return g?g.parentNode:null; }
-        var btn=document.querySelector('#btnPayNow, .btn-pay-now, button[name="paynow"], input[name="paymentmethod"]');
+        // Tela Caixa (fatura) com cartão salvo: ancora no campo CVV
+        var cvv=document.querySelector('input[name="cccvv"], input[name="cvv"], input[name="ccv"]');
+        if(cvv){ var gc=cvv.closest('.form-group')||cvv.parentNode; return gc?(gc.parentNode||gc):cvv.parentNode; }
+        // Lista de cartões salvos
+        var ccList=document.querySelector('.cc-input-container, .cc-list');
+        if(ccList) return ccList.parentNode||ccList;
+        // Botão de pagar
+        var btn=document.querySelector('#btnPayNow, .btn-pay-now, button[name="paynow"]');
         if(btn){ var f=btn.closest('form'); if(f) return f; }
         return null;
     }

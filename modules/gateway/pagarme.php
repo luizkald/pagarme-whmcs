@@ -758,18 +758,15 @@ function pagarme_resolveInstallments($params, $maxInstallments = null)
  */
 function pagarme_readSelectedInstallments()
 {
-    $chaves = array('pagarme_installments', 'lknc_installment', 'installment', 'installments');
-
-    foreach ($chaves as $chave) {
-        if (isset($_REQUEST[$chave]) && $_REQUEST[$chave] !== '') {
-            return (int) $_REQUEST[$chave];
-        }
+    // Lê APENAS o nosso campo. NÃO ler campos de outros gateways (ex: a Cielo
+    // usa 'lknc_installment' com outro modelo de juros); misturar causaria
+    // divergência entre o valor exibido e o cobrado.
+    if (isset($_REQUEST['pagarme_installments']) && $_REQUEST['pagarme_installments'] !== '') {
+        return (int) $_REQUEST['pagarme_installments'];
     }
 
-    foreach ($chaves as $chave) {
-        if (isset($_COOKIE[$chave]) && $_COOKIE[$chave] !== '') {
-            return (int) $_COOKIE[$chave];
-        }
+    if (isset($_COOKIE['pagarme_installments']) && $_COOKIE['pagarme_installments'] !== '') {
+        return (int) $_COOKIE['pagarme_installments'];
     }
 
     return 1;

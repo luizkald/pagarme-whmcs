@@ -57,3 +57,30 @@ Não há conflito: as injeções não aparecem ao mesmo tempo.
 > há juros (itens 2 e 3). O módulo aplica a parcela do juros e o WHMCS aplica o
 > restante; confirme que a fatura fecha exatamente em zero, sem saldo residual
 > nem pagamento duplicado.
+
+## Limitação conhecida: cartão salvo no pedido novo (Lagom Smart Order Form)
+
+Ao criar um PEDIDO NOVO usando um cartão já salvo, o Lagom Smart Order Form
+exibe o erro "O número do cartão que você digitou não é válido" e não envia o
+formulário. Isso é uma validação **client-side do próprio Lagom** (frontend Vue
+da RS Studio/ModulesGarden), que dispara antes do envio quando o campo de número
+de cartão está vazio — situação normal ao usar um cartão salvo.
+
+Como a validação ocorre no navegador, antes de qualquer requisição ao servidor,
+o módulo PHP não tem como interceptá-la. Confirmado: nesse cenário nenhuma linha
+aparece no Gateway Log (nada chega ao backend).
+
+Decisão de projeto: NÃO tratar isso no módulo. Impacto real é pequeno —
+- Pedido novo: o cliente digita o cartão uma vez (fluxo normal de primeira compra).
+- Renovações (via fatura): o cartão salvo funciona normalmente.
+
+Caminhos possíveis caso, no futuro, seja necessário suportar cartão salvo já no
+pedido novo:
+- Criar um gateway dedicado ao fluxo tokenizado (como a Cielo faz com
+  `lknc_cielo_credit_card_token`), reconhecido pelo Lagom como gateway de
+  tokenização.
+- Abrir chamado com o suporte do Lagom/ModulesGarden (é comportamento do produto
+  deles).
+
+O parcelamento (seletor + juros) funciona normalmente no pedido novo com cartão
+NOVO e nas faturas, inclusive com cartão salvo.
