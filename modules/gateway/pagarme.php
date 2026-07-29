@@ -154,12 +154,10 @@ function pagarme_capture($params)
         'whmcs_invoice_id' => (string) $params['invoiceid'],
     );
 
-    // Número de parcelas (até 5x SEM JUROS). Como não há acréscimo de juros,
-    // o valor cobrado é sempre igual ao total da fatura - apenas dividido.
-    // Cobranças por token (cron/recorrência) são sempre à vista.
-    $installments = empty($params['gatewayid'])
-        ? pagarme_resolveInstallments($params)
-        : 1;
+    // Número de parcelas (até 5x SEM JUROS). Vale tanto para cartão digitado
+    // quanto para cartão salvo. Em cobranças automáticas (cron/recorrência) não
+    // há seleção no request, então resolveInstallments retorna 1 (à vista).
+    $installments = pagarme_resolveInstallments($params);
 
     if (!empty($params['gatewayid'])) {
         // --- Cenário 1: cobrança de cartão salvo (token) ---
@@ -179,10 +177,13 @@ function pagarme_capture($params)
                 array(
                     'payment_method' => 'credit_card',
                     'credit_card'    => array(
-                        'installments'         => 1,
+                        'installments'         => $installments,
                         'statement_descriptor' => $descriptor,
                         'card_id'              => $token['card_id'],
-                    ), // token: sempre à vista
+                        'card'                 => array(
+                            'billing_address' => pagarme_buildAddress($params),
+                        ),
+                    ),
                 ),
             ),
             'metadata' => $metadata,
@@ -217,6 +218,7 @@ function pagarme_capture($params)
                             'exp_month'   => (int) substr($cardExpiry, 0, 2),
                             'exp_year'    => (int) ('20' . substr($cardExpiry, 2, 2)),
                             'cvv'         => pagarme_getCvv($params),
+                            'billing_address' => pagarme_buildAddress($params),
                         ),
                     ),
                 ),
@@ -584,15 +586,33 @@ function pagarme_buildCustomerPayload($params, $document, $holderName)
         'phones'   => array(
             'mobile_phone' => pagarme_parsePhone($params['clientdetails']['phonenumber']),
         ),
-        'address' => array(
-            'line_1'   => trim(
-                $params['clientdetails']['address1'] . ' ' . $params['clientdetails']['address2']
-            ),
-            'zip_code' => preg_replace('/\D/', '', $params['clientdetails']['postcode']),
-            'city'     => $params['clientdetails']['city'],
-            'state'    => $params['clientdetails']['state'],
-            'country'  => 'BR',
-        ),
+        'address' => pagarme_buildAddress($params),
+    );
+}
+
+/**
+ * Monta o objeto de endereço no formato da Pagar.me a partir dos dados do
+ * cliente. Usado tanto no cadastro do cliente quanto no billing_address da
+ * cobrança (a Pagar.me exige billing_address ao cobrar um cartão salvo).
+ *
+ * @param array $params
+ * @return array
+ */
+function pagarme_buildAddress($params)
+{
+    $cd = isset($params['clientdetails']) ? $params['clientdetails'] : array();
+
+    $line1 = trim(
+        (isset($cd['address1']) ? $cd['address1'] : '') . ' ' .
+        (isset($cd['address2']) ? $cd['address2'] : '')
+    );
+
+    return array(
+        'line_1'   => $line1 !== '' ? $line1 : 'Não informado',
+        'zip_code' => preg_replace('/\D/', '', isset($cd['postcode']) ? $cd['postcode'] : ''),
+        'city'     => isset($cd['city']) ? $cd['city'] : '',
+        'state'    => isset($cd['state']) ? $cd['state'] : '',
+        'country'  => 'BR',
     );
 }
 

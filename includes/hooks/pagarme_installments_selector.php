@@ -1,19 +1,17 @@
 <?php
 /**
- * Hook WHMCS: injeta o seletor de parcelas da Pagar.me no checkout.
+ * Hook WHMCS: injeta o seletor de parcelas da Pagar.me no checkout e na tela
+ * de pagamento de fatura (inclusive quando o cliente usa um cartão já salvo).
  *
  * Por que um hook em vez de editar o template?
- *   O seletor precisa aparecer na tela de pagamento, mas editar os arquivos
- *   do tema (ex.: Lagom / Smart Order Form) é frágil - as alterações somem
- *   quando o tema é atualizado. Este hook injeta o campo via JavaScript,
- *   funciona em qualquer tema e sobrevive a atualizações.
+ *   Editar os arquivos do tema (ex.: Lagom / Smart Order Form) é frágil - as
+ *   alterações somem quando o tema é atualizado. Este hook injeta o campo via
+ *   JavaScript, funciona em qualquer tema e sobrevive a atualizações.
  *
- * Como funciona:
- *   - Roda no rodapé das páginas de carrinho/checkout (cart.php).
- *   - Localiza o campo padrão de número de cartão (input[name="ccnumber"]).
- *   - Insere logo abaixo um <select name="pagarme_installments"> com 1x a 5x,
- *     DENTRO do mesmo <form>, para que o valor seja enviado na submissão.
- *   - Usa MutationObserver porque o checkout do Lagom carrega via AJAX.
+ * Cobre dois cenários:
+ *   1. Cartão novo digitado  -> âncora no campo input[name="ccnumber"]
+ *   2. Cartão já salvo (token) -> âncora no formulário de pagamento da fatura
+ *      (viewinvoice.php), onde não há campo de número de cartão
  *
  * O teto de 5x é fixo e sem juros. Quem decide se o parcelamento é realmente
  * permitido (parcelamento habilitado, plano anual) é o módulo, no servidor -
@@ -28,11 +26,19 @@ if (!defined('WHMCS')) {
 
 add_hook('ClientAreaFooterOutput', 1, function ($vars) {
 
-    // Injeta apenas nas páginas de carrinho/checkout
+    // Injeta nas páginas de carrinho/checkout e de visualização de fatura
     $selfUrl = isset($_SERVER['PHP_SELF']) ? $_SERVER['PHP_SELF'] : '';
     $reqUri  = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '';
+    $alvo    = array('cart.php', 'viewinvoice.php');
 
-    if (strpos($selfUrl, 'cart.php') === false && strpos($reqUri, 'cart.php') === false) {
+    $ok = false;
+    foreach ($alvo as $pagina) {
+        if (strpos($selfUrl, $pagina) !== false || strpos($reqUri, $pagina) !== false) {
+            $ok = true;
+            break;
+        }
+    }
+    if (!$ok) {
         return '';
     }
 
@@ -44,20 +50,7 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
 (function () {
     var MAX_INSTALLMENTS = {$maxInstallments};
 
-    function injetarSeletor() {
-        var cc = document.querySelector('input[name="ccnumber"]');
-        if (!cc) {
-            return; // não é a etapa de cartão
-        }
-        if (document.getElementById('pagarme_installments')) {
-            return; // já injetado
-        }
-
-        var form = cc.closest('form');
-        if (!form) {
-            return; // sem form, o valor não seria enviado
-        }
-
+    function criarSelect() {
         var wrapper = document.createElement('div');
         wrapper.className = 'form-group';
         wrapper.id = 'pagarme-installments-wrapper';
@@ -66,6 +59,7 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         var label = document.createElement('label');
         label.setAttribute('for', 'pagarme_installments');
         label.textContent = 'Parcelas';
+        label.style.display = 'block';
 
         var select = document.createElement('select');
         select.name = 'pagarme_installments';
@@ -87,24 +81,82 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         wrapper.appendChild(select);
         wrapper.appendChild(document.createElement('br'));
         wrapper.appendChild(hint);
+        return wrapper;
+    }
 
-        // Insere logo após o grupo do campo de número do cartão
+    function jaInjetado() {
+        return !!document.getElementById('pagarme_installments');
+    }
+
+    // Cenário 1: cartão novo digitado (campo ccnumber presente)
+    function injetarPorCartaoNovo() {
+        var cc = document.querySelector('input[name="ccnumber"]');
+        if (!cc) return false;
+
+        var form = cc.closest('form');
+        if (!form) return false;
+
         var host = cc.closest('.form-group') || cc.parentNode;
+        var wrapper = criarSelect();
         if (host && host.parentNode) {
             host.parentNode.insertBefore(wrapper, host.nextSibling);
         } else {
             form.appendChild(wrapper);
         }
+        return true;
+    }
+
+    // Cenário 2: pagamento de fatura com cartão salvo (viewinvoice.php).
+    // Procuramos o formulário de pagamento e inserimos o seletor dentro dele,
+    // para que o valor seja enviado junto ao submeter.
+    function injetarPorFaturaSalva() {
+        // Só age em páginas de fatura
+        if (location.href.indexOf('viewinvoice.php') === -1) return false;
+
+        // Âncoras comuns: botão de pagar ou select de método de pagamento
+        var btn = document.querySelector(
+            '#btnPayNow, input[name="paymentmethod"], select[name="paymentmethod"], .btn-pay-now, button[type="submit"][name="paynow"]'
+        );
+
+        var form = null;
+        if (btn) form = btn.closest('form');
+        if (!form) {
+            // fallback: primeiro form que aponte para viewinvoice
+            var forms = document.querySelectorAll('form');
+            for (var i = 0; i < forms.length; i++) {
+                var action = (forms[i].getAttribute('action') || '').toLowerCase();
+                if (action.indexOf('viewinvoice') !== -1 || forms[i].querySelector('[name="invoiceid"]')) {
+                    form = forms[i];
+                    break;
+                }
+            }
+        }
+        if (!form) return false;
+
+        var wrapper = criarSelect();
+        // Insere antes do botão de pagar, se houver
+        if (btn && btn.parentNode && form.contains(btn)) {
+            btn.parentNode.insertBefore(wrapper, btn);
+        } else {
+            form.appendChild(wrapper);
+        }
+        return true;
+    }
+
+    function injetar() {
+        if (jaInjetado()) return;
+        if (injetarPorCartaoNovo()) return;
+        injetarPorFaturaSalva();
     }
 
     if (document.readyState !== 'loading') {
-        injetarSeletor();
+        injetar();
     }
-    document.addEventListener('DOMContentLoaded', injetarSeletor);
+    document.addEventListener('DOMContentLoaded', injetar);
 
-    // O checkout do Lagom recarrega trechos via AJAX; reavaliamos a cada mudança
+    // O checkout/tela de fatura do Lagom recarrega trechos via AJAX
     var observer = new MutationObserver(function () {
-        injetarSeletor();
+        injetar();
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
 })();
