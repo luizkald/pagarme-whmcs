@@ -286,8 +286,9 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
     },true);
 
     // Interceptação do XHR do Lagom Order Form: ele serializa apenas campos
-    // pré-definidos e descarta selects/hidden customizados. Injetamos
-    // pagarme_installments no corpo do POST quando o gateway é a Pagar.me.
+    // pré-definidos e descarta selects/hidden/radios customizados. Injetamos
+    // no corpo do POST: (a) a seleção de cartão salvo e (b) o parcelamento,
+    // quando o gateway é a Pagar.me. Espelha a técnica do módulo Cielo.
     (function interceptXHR(){
         var origSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.send = function(body){
@@ -296,6 +297,33 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
                     (body.indexOf('paymentmethod=' + GATEWAY_KEY) !== -1 ||
                      body.indexOf('payment_method=' + GATEWAY_KEY) !== -1)) {
 
+                    var panel = document.querySelector('#mg-gateway-form-' + GATEWAY_KEY) || document;
+
+                    // (a) Toggle "novo" x "existente". O Lagom (Vue) marca a aba
+                    // ativa pela classe .active no <li>, não pelo :checked do radio.
+                    var cardInfoInput =
+                        (panel.querySelector('.nav-payment .nav-item.active input[name="cardInfo"]'))
+                        || document.querySelector('.nav-item.active input[name="cardInfo"]')
+                        || document.querySelector('input[name="cardInfo"]:checked');
+                    var cardInfoVal = cardInfoInput ? cardInfoInput.value : 'existing';
+                    if (body.indexOf('cardInfo=') === -1) {
+                        body += '&cardInfo=' + encodeURIComponent(cardInfoVal);
+                    }
+
+                    // (b) Cartão salvo: o selecionado tem a classe .active no
+                    // .cc-item (Vue), então detectamos por aí, com fallback :checked.
+                    if (cardInfoVal !== 'new') {
+                        var savedInput =
+                            (panel.querySelector('.cc-item.active input[name="' + GATEWAY_KEY + '"]'))
+                            || panel.querySelector('input[name="' + GATEWAY_KEY + '"]:checked');
+
+                        if (savedInput && savedInput.value &&
+                            body.indexOf(encodeURIComponent(GATEWAY_KEY) + '=') === -1) {
+                            body += '&' + encodeURIComponent(GATEWAY_KEY) + '=' + encodeURIComponent(savedInput.value);
+                        }
+                    }
+
+                    // (c) Parcelamento
                     var v = null;
                     var sel = document.getElementById('pagarme_installments');
                     if (sel && sel.value) {
