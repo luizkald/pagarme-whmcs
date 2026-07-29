@@ -20,6 +20,7 @@ if (!defined('WHMCS')) {
 }
 
 require_once __DIR__ . '/pagarme/pagarmeapi.php';
+require_once __DIR__ . '/pagarme/installments.php';
 
 // =========================================================================
 // Metadados e configuração
@@ -139,6 +140,70 @@ function pagarme_capture($params)
     $api        = new PagarmeApi($secretKey);
     $descriptor = pagarme_getDescriptor($params);
 
+    $metadata = array(
+        'whmcs_invoice_id' => (string) $params['invoiceid'],
+    );
+
+    // ---------------------------------------------------------------
+    // Parcelamento (Caminho B): teto por ciclo + juros ao comprador
+    // ---------------------------------------------------------------
+    $maxInstallments = pagarme_maxInstallmentsForInvoice($params['invoiceid']);
+    $installments    = pagarme_resolveInstallments($params, $maxInstallments);
+
+    // Diagnóstico: registra o que foi detectado/lido para o parcelamento
+    pagarme_log($params, array(
+        'maxInstallments'    => $maxInstallments,
+        'installments'       => $installments,
+        'enableInstallments' => isset($params['enableInstallments']) ? $params['enableInstallments'] : '(vazio)',
+        'req_pagarme'        => isset($_REQUEST['pagarme_installments']) ? $_REQUEST['pagarme_installments'] : '(ausente)',
+        'cookie_pagarme'     => isset($_COOKIE['pagarme_installments']) ? $_COOKIE['pagarme_installments'] : '(ausente)',
+    ), 'capture: diagnóstico de parcelamento');
+
+    // Bandeira do cartão (para a tabela de taxas). Cartão digitado: pelo BIN.
+    // Cartão salvo (token): usa a bandeira gravada no token, se houver.
+    if (!empty($params['gatewayid'])) {
+        $tokenInfo = pagarme_parseToken($params['gatewayid']);
+        $brand     = ($tokenInfo && !empty($tokenInfo['brand'])) ? $tokenInfo['brand'] : 'outras';
+    } else {
+        $brand = pagarme_detectBrand(isset($params['cardnum']) ? $params['cardnum'] : '');
+    }
+
+    // Juros repassado ao comprador (0 dentro da faixa sem juros)
+    $customerRate = pagarme_customerRate($brand, $installments, $maxInstallments);
+    $chargeAmount = $params['amount'];
+
+    if ($customerRate > 0) {
+        $feeAmount = round($params['amount'] * ($customerRate / 100), 2);
+
+        // Reconciliação: adiciona o juros como item na fatura, para que o
+        // total cobrado seja igual ao total da fatura no WHMCS.
+        $newTotal = pagarme_applyInstallmentFee($params['invoiceid'], $feeAmount, $installments);
+
+        if ($newTotal !== null) {
+            $chargeAmount = $newTotal;
+            pagarme_log($params, array(
+                'installments' => $installments,
+                'brand'        => $brand,
+                'rate'         => $customerRate,
+                'fee'          => $feeAmount,
+                'new_total'    => $newTotal,
+            ), 'capture: juros de parcelamento aplicado');
+        } else {
+            // Falha ao reconciliar: não cobramos o cliente por um valor que
+            // não bate com a fatura. Melhor recusar e registrar.
+            pagarme_log($params, array(
+                'installments' => $installments,
+                'fee'          => $feeAmount,
+            ), 'capture: falha ao aplicar juros na fatura');
+            return array(
+                'status'  => 'declined',
+                'rawdata' => 'Não foi possível aplicar a taxa de parcelamento na fatura.',
+            );
+        }
+    }
+
+    $amountCents = (int) round($chargeAmount * 100);
+
     $items = array(
         array(
             // 'code' é obrigatório na API v5 da Pagar.me: identifica o item
@@ -149,15 +214,6 @@ function pagarme_capture($params)
             'quantity'    => 1,
         ),
     );
-
-    $metadata = array(
-        'whmcs_invoice_id' => (string) $params['invoiceid'],
-    );
-
-    // Número de parcelas (até 5x SEM JUROS). Vale tanto para cartão digitado
-    // quanto para cartão salvo. Em cobranças automáticas (cron/recorrência) não
-    // há seleção no request, então resolveInstallments retorna 1 (à vista).
-    $installments = pagarme_resolveInstallments($params);
 
     if (!empty($params['gatewayid'])) {
         // --- Cenário 1: cobrança de cartão salvo (token) ---
@@ -253,7 +309,24 @@ function pagarme_capture($params)
                 'charge_id'    => $charge['id'],
                 'order_id'     => $response['id'],
                 'installments' => $installments,
+                'amount'       => $chargeAmount,
             ), 'capture: pago');
+
+            // Se houve juros de parcelamento, o total cobrado é maior que o
+            // $params['amount'] original. Já adicionamos o item de juros à
+            // fatura (total = amount + juros). Aqui aplicamos SOMENTE a parcela
+            // do juros, deixando o saldo restante igual ao $params['amount'] -
+            // que é exatamente o que o WHMCS aplica em seguida ao receber o
+            // 'success'. Assim a fatura fecha em zero sem duplicar pagamento,
+            // funcione o WHMCS com $params['amount'] ou relendo o saldo.
+            if ($chargeAmount > $params['amount']) {
+                pagarme_applyInterestPortion(
+                    $params['invoiceid'],
+                    $charge['id'],
+                    $chargeAmount - $params['amount']
+                );
+            }
+
             return array(
                 'status'  => 'success',
                 'transid' => $charge['id'],
@@ -457,7 +530,7 @@ function pagarme_storeremote($params)
 
     return array(
         'status'    => 'success',
-        'gatewayid' => pagarme_buildToken($customer['id'], $card['id']),
+        'gatewayid' => pagarme_buildToken($customer['id'], $card['id'], isset($card['brand']) ? $card['brand'] : ''),
         'cardType'  => isset($card['brand']) ? $card['brand'] : '',
         'lastFour'  => isset($card['last_four_digits']) ? $card['last_four_digits'] : '',
         'expDate'   => $cardExpiry,
@@ -641,33 +714,65 @@ if (!defined('PAGARME_MAX_INSTALLMENTS')) {
  * @param array $params
  * @return int
  */
-function pagarme_resolveInstallments($params)
+function pagarme_resolveInstallments($params, $maxInstallments = null)
 {
     // Parcelamento desabilitado -> à vista
     if (empty($params['enableInstallments']) || $params['enableInstallments'] != 'on') {
         return 1;
     }
 
-    // Restrição a planos anuais
-    $annualOnly = !isset($params['installmentsAnnualOnly']) || $params['installmentsAnnualOnly'] == 'on';
-    if ($annualOnly && !pagarme_isInvoiceAnnual($params)) {
+    // Teto por ciclo da fatura (mensal 1x, trimestral 3x, semestral 6x, anual+ 12x)
+    if ($maxInstallments === null) {
+        $maxInstallments = pagarme_maxInstallmentsForInvoice(
+            isset($params['invoiceid']) ? $params['invoiceid'] : 0
+        );
+    }
+
+    // Ciclo que só permite à vista
+    if ($maxInstallments <= 1) {
         return 1;
     }
 
-    // Valor escolhido pelo cliente no checkout
-    $selected = 1;
-    if (isset($_REQUEST['pagarme_installments'])) {
-        $selected = (int) $_REQUEST['pagarme_installments'];
-    }
+    // Valor escolhido pelo cliente. O seletor injetado posta em
+    // 'pagarme_installments'; mantemos fallbacks por robustez, inclusive cookie.
+    $selected = pagarme_readSelectedInstallments();
 
     if ($selected < 1) {
         $selected = 1;
     }
-    if ($selected > PAGARME_MAX_INSTALLMENTS) {
-        $selected = PAGARME_MAX_INSTALLMENTS;
+    if ($selected > $maxInstallments) {
+        $selected = $maxInstallments;
     }
 
     return $selected;
+}
+
+/**
+ * Lê o número de parcelas escolhido pelo cliente a partir do request.
+ *
+ * O seletor injetado posta 'pagarme_installments'. Como alguns temas (Lagom)
+ * serializam apenas campos pré-definidos e descartam selects customizados, há
+ * fallback por cookie, espelhando a técnica usada pelo módulo Cielo.
+ *
+ * @return int
+ */
+function pagarme_readSelectedInstallments()
+{
+    $chaves = array('pagarme_installments', 'lknc_installment', 'installment', 'installments');
+
+    foreach ($chaves as $chave) {
+        if (isset($_REQUEST[$chave]) && $_REQUEST[$chave] !== '') {
+            return (int) $_REQUEST[$chave];
+        }
+    }
+
+    foreach ($chaves as $chave) {
+        if (isset($_COOKIE[$chave]) && $_COOKIE[$chave] !== '') {
+            return (int) $_COOKIE[$chave];
+        }
+    }
+
+    return 1;
 }
 
 /**
@@ -990,13 +1095,15 @@ function pagarme_parsePhone($phoneNumber)
  * @param string $cardId
  * @return string
  */
-function pagarme_buildToken($customerId, $cardId)
+function pagarme_buildToken($customerId, $cardId, $brand = '')
 {
-    return $customerId . '|' . $cardId;
+    // Formato: customer_id|card_id|brand (brand opcional, para a tabela de taxas)
+    return $customerId . '|' . $cardId . '|' . $brand;
 }
 
 /**
- * Decodifica o token salvo pelo WHMCS de volta em customer_id + card_id
+ * Decodifica o token salvo pelo WHMCS de volta em customer_id + card_id + brand.
+ * Tolera tokens antigos no formato customer_id|card_id (sem bandeira).
  *
  * @param string $token
  * @return array|null
@@ -1007,7 +1114,10 @@ function pagarme_parseToken($token)
         return null;
     }
 
-    list($customerId, $cardId) = explode('|', $token, 2);
+    $parts      = explode('|', $token);
+    $customerId = isset($parts[0]) ? $parts[0] : '';
+    $cardId     = isset($parts[1]) ? $parts[1] : '';
+    $brand      = isset($parts[2]) ? $parts[2] : '';
 
     if (empty($customerId) || empty($cardId)) {
         return null;
@@ -1016,5 +1126,6 @@ function pagarme_parseToken($token)
     return array(
         'customer_id' => $customerId,
         'card_id'     => $cardId,
+        'brand'       => $brand,
     );
 }
