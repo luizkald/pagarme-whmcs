@@ -71,20 +71,15 @@ function pagarme_config()
             'Description'  => 'Texto exibido na fatura do cartão do cliente (máximo 13 caracteres)',
         ),
         'enableInstallments' => array(
-            'FriendlyName' => 'Parcelamento (até 5x sem juros)',
+            'FriendlyName' => 'Parcelamento com juros por ciclo',
             'Type'         => 'yesno',
-            'Description'  => 'Permite ao cliente parcelar em até 5x SEM JUROS. '
-                . 'Só é oferecido em faturas de planos anuais ou de ciclo maior '
-                . '(ver "Somente planos anuais" abaixo). O teto de 5x é fixo e '
-                . 'não há acréscimo de juros — o valor cobrado é igual ao total da fatura.',
-        ),
-        'installmentsAnnualOnly' => array(
-            'FriendlyName' => 'Somente planos anuais',
-            'Type'         => 'yesno',
-            'Default'      => 'on',
-            'Description'  => 'Quando marcado, o parcelamento só é oferecido se TODOS os itens '
-                . 'da fatura forem de ciclo anual ou maior (Annually, Biennially, Triennially). '
-                . 'Faturas mensais/trimestrais são cobradas somente à vista.',
+            'Description'  => 'Permite ao cliente parcelar a fatura. O teto de parcelas e a faixa '
+                . 'sem juros dependem do ciclo de cobrança do plano: mensal só à vista; trimestral '
+                . 'até 3x (todas com juros); semestral até 6x (1x-3x sem juros, 4x-6x com juros); '
+                . 'anual/bienal até 12x (1x-5x sem juros, 6x-12x com juros); trienal até 12x (1x-6x '
+                . 'sem juros, 7x-12x com juros). Acima da faixa sem juros, o juros (taxa da '
+                . 'adquirente + margem da loja) é repassado ao comprador. Detalhes em '
+                . 'docs/parcelamento-com-juros.md.',
         ),
         'cpfCustomField' => array(
             'FriendlyName' => 'Nome do Campo Personalizado (CPF/CNPJ)',
@@ -147,12 +142,14 @@ function pagarme_capture($params)
     // ---------------------------------------------------------------
     // Parcelamento (Caminho B): teto por ciclo + juros ao comprador
     // ---------------------------------------------------------------
-    $maxInstallments = pagarme_maxInstallmentsForInvoice($params['invoiceid']);
-    $installments    = pagarme_resolveInstallments($params, $maxInstallments);
+    $maxInstallments  = pagarme_maxInstallmentsForInvoice($params['invoiceid']);
+    $freeInstallments = pagarme_freeInstallmentsForInvoice($params['invoiceid']);
+    $installments     = pagarme_resolveInstallments($params, $maxInstallments);
 
     // Diagnóstico: registra o que foi detectado/lido para o parcelamento
     pagarme_log($params, array(
         'maxInstallments'    => $maxInstallments,
+        'freeInstallments'   => $freeInstallments,
         'installments'       => $installments,
         'enableInstallments' => isset($params['enableInstallments']) ? $params['enableInstallments'] : '(vazio)',
         'req_pagarme'        => isset($_REQUEST['pagarme_installments']) ? $_REQUEST['pagarme_installments'] : '(ausente)',
@@ -169,7 +166,7 @@ function pagarme_capture($params)
     }
 
     // Juros repassado ao comprador (0 dentro da faixa sem juros)
-    $customerRate = pagarme_customerRate($brand, $installments, $maxInstallments);
+    $customerRate = pagarme_customerRate($brand, $installments, $freeInstallments);
     $chargeAmount = $params['amount'];
 
     if ($customerRate > 0) {
@@ -690,26 +687,19 @@ function pagarme_buildAddress($params)
 }
 
 /**
- * Teto fixo de parcelas sem juros. Definido como constante porque, no modelo
- * "sem juros", ultrapassar isso exigiria acréscimo no valor e reconciliação
- * da fatura (fora do escopo atual).
- */
-if (!defined('PAGARME_MAX_INSTALLMENTS')) {
-    define('PAGARME_MAX_INSTALLMENTS', 5);
-}
-
-/**
  * Determina em quantas parcelas a cobrança deve ser feita.
  *
  * Regras:
  *   - Parcelamento precisa estar habilitado na configuração.
- *   - Se "Somente planos anuais" estiver marcado, a fatura inteira precisa ser
- *     de ciclo anual ou maior.
- *   - O cliente escolhe entre 1 e PAGARME_MAX_INSTALLMENTS (5) via seletor no
- *     checkout (campo "pagarme_installments" no request).
+ *   - O teto de parcelas depende do ciclo de cobrança da fatura (ver
+ *     pagarme_maxInstallmentsForMonths): mensal 1x, trimestral 3x,
+ *     semestral 6x, anual ou superior 12x.
+ *   - O cliente escolhe entre 1x e o teto via seletor no checkout (campo
+ *     "pagarme_installments" no request).
  *   - Qualquer valor inválido ou fora do intervalo cai para 1x (à vista).
  *
- * Não há juros: o valor cobrado é sempre o total da fatura, apenas dividido.
+ * Acima da faixa sem juros do ciclo (ver pagarme_freeInstallmentsForMonths),
+ * o juros é repassado ao comprador em pagarme_capture().
  *
  * @param array $params
  * @return int

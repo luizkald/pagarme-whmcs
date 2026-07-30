@@ -127,12 +127,14 @@ prefira uma solução via addon em vez de hook customizado.
 - **PCI-DSS**: como o cartão é digitado diretamente no seu site (sem tokenização
   client-side), seu ambiente precisa estar em conformidade com PCI-DSS — HTTPS
   obrigatório em toda a aplicação e nenhum dado de cartão em log ou banco.
-- **Parcelamento (até 5x sem juros)**: o módulo permite parcelar em até 5x SEM JUROS,
-  somente em faturas de planos anuais (configurável). Não há acréscimo de valor — a
-  cobrança é sempre igual ao total da fatura, apenas dividida, então não há impacto na
-  reconciliação da fatura. Para ativar:
-  1. Nas configurações do gateway, marque **"Parcelamento (até 5x sem juros)"** e, se
-     desejar restringir, **"Somente planos anuais"**.
+- **Parcelamento com juros por ciclo**: o teto de parcelas e a faixa sem juros
+  dependem do ciclo de cobrança do plano (mensal só à vista; trimestral até 3x, todas
+  com juros; semestral até 3x sem juros e 4x-6x com juros; anual/bienal até 5x sem
+  juros e 6x-12x com juros; trienal até 6x sem juros e 7x-12x com juros). Acima da
+  faixa sem juros, o juros (taxa da adquirente + margem da loja) é repassado ao
+  comprador e reconciliado como item na fatura. Detalhes completos das regras e dos
+  arquivos envolvidos em `docs/parcelamento-com-juros.md`. Para ativar:
+  1. Nas configurações do gateway, marque a opção de parcelamento.
   2. Adicione o seletor de parcelas ao checkout. Em temas que sobrescrevem os
      templates padrão (ex.: **Lagom / Smart Order Form**), use o hook pronto:
      copie `includes/hooks/pagarme_installments_selector.php` para `/includes/hooks/`.
@@ -141,9 +143,8 @@ prefira uma solução via addon em vez de hook customizado.
      `docs/seletor-parcelas-checkout.md`. Sem esse passo, o campo não chega ao módulo
      e todas as cobranças ficam à vista.
 
-  O teto de 5x é fixo (constante `PAGARME_MAX_INSTALLMENTS`). A regra de "quando
-  parcelar" é aplicada no servidor: mesmo que o cliente veja o seletor, o módulo cobra
-  à vista se o parcelamento estiver desligado ou a fatura não for de plano anual.
-  Cobranças automáticas por cartão salvo (cron/recorrência) são sempre à vista.
+  A regra de "quando parcelar" é aplicada no servidor: mesmo que o cliente veja o
+  seletor, o módulo cobra à vista se o parcelamento estiver desligado. Cobranças
+  automáticas por cartão salvo (cron/recorrência) são sempre à vista.
 - **Antifraude**: pedidos que retornam `processing` ficam pendentes no WHMCS até a
   confirmação chegar pelo webhook.

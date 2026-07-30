@@ -10,10 +10,13 @@
  *   - Reconciliação: o juros é adicionado como item na fatura, para que o
  *     total cobrado seja igual ao total da fatura (contabilidade do WHMCS)
  *
- * Regras de faixa sem juros (definidas com a Stay):
- *   - Anual ou superior : 1x a 5x sem juros; 6x a 12x com juros
- *   - Trimestral/Semestral : apenas 1x sem juros; 2x+ com juros
- *   - Mensal : somente 1x
+ * Regras de faixa sem juros por ciclo (definidas com a Stay):
+ *   - Mensal      : somente 1x (à vista)
+ *   - Trimestral  : até 3x, todas com juros (só 1x é sem juros)
+ *   - Semestral   : 1x a 3x sem juros; 4x a 6x com juros
+ *   - Anual       : 1x a 5x sem juros; 6x a 12x com juros
+ *   - Bienal      : 1x a 5x sem juros; 6x a 12x com juros
+ *   - Trienal     : 1x a 6x sem juros; 7x a 12x com juros
  *
  * IMPORTANTE: as tabelas em inc/pagarme_credit_card_taxes.json são um CLONE
  * das taxas da Cielo, usadas como placeholder. Substituir pelas taxas reais
@@ -66,22 +69,23 @@ function pagarme_cycleToMonths($cycle)
 }
 
 /**
- * Determina o máximo de parcelas para uma fatura, consultando o ciclo de
- * cobrança de cada serviço vinculado. O MENOR período manda (item mais
- * restritivo determina o teto), espelhando a regra do módulo Cielo.
+ * Determina o ciclo (em meses) que rege o parcelamento de uma fatura,
+ * consultando o ciclo de cobrança de cada serviço vinculado. O MENOR período
+ * manda (item mais restritivo determina o teto), espelhando a regra do
+ * módulo Cielo.
  *
  * @param int $invoiceId
- * @return int Máximo de parcelas (1 se não detectar)
+ * @return int Meses do ciclo mais restritivo (0 se não detectar)
  */
-function pagarme_maxInstallmentsForInvoice($invoiceId)
+function pagarme_minMonthsForInvoice($invoiceId)
 {
     if (!function_exists('localAPI') || !$invoiceId) {
-        return 1;
+        return 0;
     }
 
     $invoice = localAPI('GetInvoice', array('invoiceid' => $invoiceId));
     if (empty($invoice['items']['item'])) {
-        return 1;
+        return 0;
     }
 
     $items = $invoice['items']['item'];
@@ -89,8 +93,7 @@ function pagarme_maxInstallmentsForInvoice($invoiceId)
         $items = array($items);
     }
 
-    $minMonths   = null;
-    $foundCycle  = false;
+    $minMonths = null;
 
     foreach ($items as $item) {
         $relid = isset($item['relid']) ? (int) $item['relid'] : 0;
@@ -114,31 +117,67 @@ function pagarme_maxInstallmentsForInvoice($invoiceId)
 
         $months = pagarme_cycleToMonths($service->billingcycle);
         if ($months > 0) {
-            $foundCycle = true;
             if ($minMonths === null || $months < $minMonths) {
                 $minMonths = $months;
             }
         }
     }
 
-    if (!$foundCycle) {
-        return 1;
-    }
-
-    return pagarme_maxInstallmentsForMonths($minMonths);
+    return $minMonths === null ? 0 : $minMonths;
 }
 
 /**
- * Número de parcelas sem juros para um determinado teto de parcelas.
+ * Determina o máximo de parcelas para uma fatura.
  *
- * Regra: anual+ (teto 12) => 5 parcelas sem juros; demais => apenas 1x.
+ * @param int $invoiceId
+ * @return int Máximo de parcelas (1 se não detectar)
+ */
+function pagarme_maxInstallmentsForInvoice($invoiceId)
+{
+    return pagarme_maxInstallmentsForMonths(pagarme_minMonthsForInvoice($invoiceId));
+}
+
+/**
+ * Número de parcelas sem juros conforme o ciclo (em meses).
  *
- * @param int $maxInstallments
+ * Regra (definida com a Stay):
+ *   - Mensal (1)          : 1x (só à vista)
+ *   - Trimestral (3)      : 1x (2x-3x já têm juros)
+ *   - Semestral (6)       : 3x
+ *   - Anual (12)          : 5x
+ *   - Bienal (24)         : 5x
+ *   - Trienal (36 ou mais): 6x
+ *
+ * @param int $months
  * @return int
  */
-function pagarme_freeInstallments($maxInstallments)
+function pagarme_freeInstallmentsForMonths($months)
 {
-    return ($maxInstallments >= 12) ? 5 : 1;
+    if ($months <= 1) {
+        return 1;
+    }
+    if ($months <= 3) {
+        return 1;
+    }
+    if ($months <= 6) {
+        return 3;
+    }
+    if ($months <= 24) {
+        return 5;
+    }
+    return 6; // trienal ou superior
+}
+
+/**
+ * Número de parcelas sem juros para uma fatura, conforme o ciclo mais
+ * restritivo entre os serviços vinculados.
+ *
+ * @param int $invoiceId
+ * @return int
+ */
+function pagarme_freeInstallmentsForInvoice($invoiceId)
+{
+    return pagarme_freeInstallmentsForMonths(pagarme_minMonthsForInvoice($invoiceId));
 }
 
 /**
@@ -222,15 +261,15 @@ function pagarme_detectBrand($number)
  * customer = 0 dentro da faixa sem juros; acima dela, taxa da adquirente +
  * margem da loja.
  *
- * @param string $brand           Bandeira normalizada
- * @param int    $installments    Número de parcelas escolhido
- * @param int    $maxInstallments Teto de parcelas do ciclo
+ * @param string $brand            Bandeira normalizada
+ * @param int    $installments     Número de parcelas escolhido
+ * @param int    $freeInstallments Parcelas sem juros do ciclo (ver
+ *                                 pagarme_freeInstallmentsForMonths)
  * @return float Percentual a acrescentar (ex: 3.09 = 3,09%)
  */
-function pagarme_customerRate($brand, $installments, $maxInstallments)
+function pagarme_customerRate($brand, $installments, $freeInstallments)
 {
-    $free = pagarme_freeInstallments($maxInstallments);
-    if ($installments <= $free) {
+    if ($installments <= $freeInstallments) {
         return 0.0;
     }
 

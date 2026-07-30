@@ -4,16 +4,21 @@ Replica o modelo do módulo Cielo para a Pagar.me, permitindo coexistência das 
 
 ## Regras implementadas
 
-M�ximo de parcelas por ciclo (item mais restritivo da fatura manda):
-- Mensal: 1x
-- Trimestral: até 3x
-- Semestral: até 6x
-- Anual ou superior: até 12x
+Teto de parcelas e faixa sem juros por ciclo (item mais restritivo da fatura
+manda, ver `pagarme_minMonthsForInvoice`):
 
-Faixa sem juros:
-- Anual+: 1x a 5x sem juros; 6x a 12x com juros
-- Trimestral/Semestral: apenas 1x (à vista); 2x+ com juros
-- Mensal: só 1x
+| Ciclo      | Teto de parcelas | Sem juros | Com juros (taxa da plataforma) |
+|------------|:---:|:---:|:---:|
+| Mensal     | 1x  | —      | — (só à vista) |
+| Trimestral | 3x  | 1x     | 2x a 3x |
+| Semestral  | 6x  | 1x a 3x | 4x a 6x |
+| Anual      | 12x | 1x a 5x | 6x a 12x |
+| Bienal     | 12x | 1x a 5x | 6x a 12x |
+| Trienal    | 12x | 1x a 6x | 7x a 12x |
+
+Implementado em `pagarme_maxInstallmentsForMonths` (teto) e
+`pagarme_freeInstallmentsForMonths` (faixa sem juros), ambas em
+`installments.php`.
 
 O juros (taxa da adquirente + margem da loja) é repassado ao comprador e
 adicionado como item na fatura, para que o total cobrado bata com a

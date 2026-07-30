@@ -2,10 +2,14 @@
 /**
  * Hook WHMCS: seletor de parcelamento da Pagar.me (Caminho B - com juros).
  *
- * Espelha o comportamento do módulo Cielo, porém para o gateway Pagar.me:
- *   - Até 12x, com teto por ciclo (mensal 1x, trimestral 3x, semestral 6x,
- *     anual+ 12x)
- *   - 1x-5x sem juros SOMENTE em anual+; nos demais ciclos, só 1x sem juros
+ * Espelha o comportamento do módulo Cielo, porém para o gateway Pagar.me.
+ * Teto de parcelas e faixa sem juros por ciclo:
+ *   - Mensal      : só 1x (à vista)
+ *   - Trimestral  : até 3x, todas com juros (só 1x é sem juros)
+ *   - Semestral   : até 6x; 1x-3x sem juros, 4x-6x com juros
+ *   - Anual       : até 12x; 1x-5x sem juros, 6x-12x com juros
+ *   - Bienal      : até 12x; 1x-5x sem juros, 6x-12x com juros
+ *   - Trienal     : até 12x; 1x-6x sem juros, 7x-12x com juros
  *   - Juros (taxa da adquirente + margem) repassado ao comprador acima da
  *     faixa sem juros, exibindo o valor de cada parcela e a taxa total
  *   - Posta o campo 'pagarme_installments' (com fallback por cookie, pois o
@@ -61,16 +65,19 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         }
     }
 
-    // Máximo de parcelas server-side quando é página de fatura (consulta ciclo)
-    $serverMax = 0;
-    $invoiceId = 0;
+    // Máximo de parcelas e faixa sem juros server-side quando é página de
+    // fatura (consulta ciclo)
+    $serverMax  = 0;
+    $serverFree = 0;
+    $invoiceId  = 0;
     if (preg_match('#/invoice/(\d+)#', $uri, $mm)) {
         $invoiceId = (int) $mm[1];
     } elseif (preg_match('#viewinvoice\.php.*[?&]id=(\d+)#', $uri, $mm)) {
         $invoiceId = (int) $mm[1];
     }
     if ($invoiceId > 0 && function_exists('pagarme_maxInstallmentsForInvoice')) {
-        $serverMax = (int) pagarme_maxInstallmentsForInvoice($invoiceId);
+        $serverMax  = (int) pagarme_maxInstallmentsForInvoice($invoiceId);
+        $serverFree = (int) pagarme_freeInstallmentsForInvoice($invoiceId);
     } elseif ($invoiceId > 0) {
         // Fallback: replica o cálculo sem depender do módulo estar incluído
         try {
@@ -92,9 +99,12 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
                 }
             }
             if ($found) {
+                // Teto de parcelas por ciclo
                 if ($minM<=1) $serverMax=1; elseif($minM<=3)$serverMax=3; elseif($minM<=6)$serverMax=6; else $serverMax=12;
+                // Faixa sem juros por ciclo (ver pagarme_freeInstallmentsForMonths)
+                if ($minM<=1) $serverFree=1; elseif($minM<=3)$serverFree=1; elseif($minM<=6)$serverFree=3; elseif($minM<=24)$serverFree=5; else $serverFree=6;
             }
-        } catch (\Throwable $e) { $serverMax = 0; }
+        } catch (\Throwable $e) { $serverMax = 0; $serverFree = 0; }
     }
 
     return <<<HTML
@@ -102,6 +112,7 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
 (function () {
     var GATEWAY_KEY = '{$gatewayKey}';
     var SERVER_MAX = {$serverMax};
+    var SERVER_FREE = {$serverFree};
     var FEES = {$feesJson};
     var MARGINS = {$marginsJson};
 
@@ -114,7 +125,20 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         var n=parseFloat(t); return isNaN(n)?0:n;
     }
 
-    function freeInstallments(maxInst){ return (maxInst>=12)?5:1; }
+    // Faixa sem juros por ciclo (meses do billingcycle). Espelha
+    // pagarme_freeInstallmentsForMonths() do módulo PHP: mensal/trimestral
+    // 1x, semestral 3x, anual/bienal 5x, trienal+ 6x.
+    var FREE_BY_CYCLE = {
+        free: 1, onetime: 5, monthly: 1, quarterly: 1,
+        semiannually: 3, 'semi-annually': 3,
+        annually: 5, biennially: 5, triennially: 6
+    };
+    // Teto de parcelas por ciclo. Espelha pagarme_maxInstallmentsForMonths().
+    var MAX_BY_CYCLE = {
+        free: 1, onetime: 12, monthly: 1, quarterly: 3,
+        semiannually: 6, 'semi-annually': 6,
+        annually: 12, biennially: 12, triennially: 12
+    };
 
     function detectBrand(num){
         num=(num||'').replace(/\D/g,'');
@@ -149,8 +173,7 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return 'outras';
     }
 
-    function getRate(brand, n, maxInst){
-        var free=freeInstallments(maxInst);
+    function getRate(brand, n, free){
         if(n<=free) return 0;
         var bt=(FEES[brand]&&FEES[brand].credito)||(FEES.outras&&FEES.outras.credito)||{};
         var mt=(MARGINS.credito)||{};
@@ -177,15 +200,53 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return false;
     }
 
+    // Nome do ciclo em pt-BR -> [chave de ciclo, meses]. Os meses servem para
+    // eleger o ciclo mais restritivo quando o resumo lista vários.
+    var CYCLE_LABELS = [
+        ['mensal', 'monthly', 1], ['trimestral', 'quarterly', 3],
+        ['semestral', 'semiannually', 6], ['trienal', 'triennially', 36],
+        ['bienal', 'biennially', 24], ['anual', 'annually', 12]
+    ];
+
+    // Ciclo lido do Resumo do Pedido. O Lagom (Vue) não renderiza campo
+    // billingcycle quando o produto tem um único ciclo, então o nome exibido
+    // ali é a única fonte no DOM.
+    function cycleFromSummary(){
+        var box=document.querySelector('.order-summary .summary-list-recurring')
+            ||document.querySelector('.order-summary');
+        if(!box) return '';
+        var txt=(box.textContent||'').toLowerCase();
+        // 'anual' é substring de 'bienal'/'trienal': remove os compostos antes.
+        var scan=txt.replace(/trienal/g,' ').replace(/bienal/g,' ');
+        var best='', bestMonths=0;
+        for(var i=0;i<CYCLE_LABELS.length;i++){
+            var label=CYCLE_LABELS[i][0];
+            var hay=(label==='anual')?scan:txt;
+            if(hay.indexOf(label)===-1) continue;
+            var months=CYCLE_LABELS[i][2];
+            if(!best||months<bestMonths){ best=CYCLE_LABELS[i][1]; bestMonths=months; }
+        }
+        return best;
+    }
+
+    function currentCycleValue(){
+        var cycleEl=document.querySelector('input[name="billingcycle"]:checked, select[name="billingcycle"]');
+        if(cycleEl) return (cycleEl.value||'').toLowerCase();
+        return cycleFromSummary();
+    }
+
     function maxAllowed(){
         if(SERVER_MAX>0) return SERVER_MAX;
-        var cycleEl=document.querySelector('input[name="billingcycle"]:checked, select[name="billingcycle"]');
-        if(cycleEl){
-            var map={free:1,onetime:12,monthly:1,quarterly:3,semiannually:6,'semi-annually':6,annually:12,biennially:12,triennially:12};
-            var v=(cycleEl.value||'').toLowerCase();
-            if(map[v]!==undefined) return map[v];
-        }
+        var v=currentCycleValue();
+        if(MAX_BY_CYCLE[v]!==undefined) return MAX_BY_CYCLE[v];
         return 12;
+    }
+
+    function freeAllowed(){
+        if(SERVER_FREE>0) return SERVER_FREE;
+        var v=currentCycleValue();
+        if(FREE_BY_CYCLE[v]!==undefined) return FREE_BY_CYCLE[v];
+        return 1;
     }
 
     function setInstallmentValue(v){
@@ -209,6 +270,7 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         if(!isPagarmeSelected()){ removeIt(); return; }
         var total=getTotal();
         var maxInst=maxAllowed();
+        var free=freeAllowed();
         var brand=currentBrand();
 
         var sel=document.getElementById('pagarme_installments');
@@ -237,7 +299,7 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         var prev=sel.value;
         sel.innerHTML='';
         for(var n=1;n<=maxInst;n++){
-            var rate=getRate(brand,n,maxInst);
+            var rate=getRate(brand,n,free);
             var perInst=(total>0)?(total*(1+rate/100)/n):0;
             var opt=document.createElement('option');
             opt.value=n;
