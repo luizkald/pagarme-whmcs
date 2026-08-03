@@ -44,6 +44,17 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return '';
     }
 
+    // É a montagem do pedido (order form do Lagom) e não uma fatura? Só nela o
+    // cartão salvo precisa ser ocultado - ver bloco IS_ORDER_FORM no JS abaixo.
+    $isOrderForm = false;
+    foreach (array('cart.php', '/store/', '/order') as $p) {
+        if (strpos($uri, $p) !== false) { $isOrderForm = true; break; }
+    }
+    foreach (array('viewinvoice.php', '/invoice/') as $p) {
+        if (strpos($uri, $p) !== false) { $isOrderForm = false; break; }
+    }
+    $isOrderFormJs = $isOrderForm ? 'true' : 'false';
+
     // Carrega tabelas de taxa/margem server-side (evita fetch bloqueado por .htaccess)
     $incPath = dirname(dirname(__DIR__)) . '/modules/gateways/pagarme/inc';
 
@@ -111,6 +122,7 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
 <script>
 (function () {
     var GATEWAY_KEY = '{$gatewayKey}';
+    var IS_ORDER_FORM = {$isOrderFormJs};
     var SERVER_MAX = {$serverMax};
     var SERVER_FREE = {$serverFree};
     var FEES = {$feesJson};
@@ -249,6 +261,51 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return 1;
     }
 
+    // Na MONTAGEM DO PEDIDO, cartão salvo não conclui: o Lagom posta
+    // 'ccinfo=<id do pay method>' e o WHMCS core recusa antes de chamar o
+    // módulo, respondendo "O número do cartão que você digitou não é válido"
+    // (comprovado por captura de XHR; ocorre também com a Cielo tokenizada,
+    // ou seja, não é específico deste gateway). Como oferecer uma opção que
+    // não finaliza o pedido só gera chamado de suporte, escondemos a aba e
+    // deixamos apenas "cartão novo".
+    //
+    // Escopo: SOMENTE o order form. Na fatura o cartão salvo funciona
+    // normalmente e não é tocado - assim como a renovação automática pelo
+    // cron, que nem passa por esta tela.
+    function enforceNewCardOnly(){
+        if(!IS_ORDER_FORM) return;
+        var panel=document.querySelector('#mg-gateway-form-'+GATEWAY_KEY);
+        if(!panel) return;
+        var exRadio=panel.querySelector('input[name="cardInfo"][value="existing"]');
+        var nwRadio=panel.querySelector('input[name="cardInfo"][value="new"]');
+        if(!exRadio||!nwRadio) return;
+        var exLi=exRadio.closest('.nav-item'), nwLi=nwRadio.closest('.nav-item');
+        if(!exLi||!nwLi) return;
+
+        exLi.style.display='none';
+
+        // Já está na aba de cartão novo: nada mais a fazer.
+        if(!exLi.classList.contains('active')) return;
+
+        if(exLi.dataset.pgmSwitch==='1'){
+            // O clique não trocou a aba (Vue não reagiu). Esconde a lista de
+            // cartões salvos para não oferecer algo que será recusado.
+            var lista=panel.querySelector('.cc-input-container');
+            if(lista) lista.style.display='none';
+            return;
+        }
+        exLi.dataset.pgmSwitch='1';
+
+        // O <a> tem href="" e recarregaria a página; o preventDefault em fase
+        // de captura evita isso sem impedir o handler do Vue (preventDefault
+        // não interrompe outros listeners).
+        var alvo=nwLi.querySelector('a')||nwLi;
+        try{
+            alvo.addEventListener('click',function(e){ e.preventDefault(); },{capture:true,once:true});
+            alvo.click();
+        }catch(e){}
+    }
+
     function setInstallmentValue(v){
         v=String(parseInt(v,10)||1);
         try{ document.cookie='pagarme_installments='+v+'; path=/; max-age=900; SameSite=Lax'; }catch(e){}
@@ -268,6 +325,7 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
 
     function buildOrUpdate(){
         if(!isPagarmeSelected()){ removeIt(); return; }
+        enforceNewCardOnly();
         var total=getTotal();
         var maxInst=maxAllowed();
         var free=freeAllowed();
@@ -380,6 +438,10 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
                         || document.querySelector('.nav-item.active input[name="cardInfo"]')
                         || document.querySelector('input[name="cardInfo"]:checked');
                     var cardInfoVal = cardInfoInput ? cardInfoInput.value : 'existing';
+                    // No order form o cartão salvo é recusado pelo WHMCS (ver
+                    // enforceNewCardOnly), então nunca postamos 'existing' ali -
+                    // nem pelo fallback acima, se a aba não for encontrada.
+                    if (IS_ORDER_FORM) { cardInfoVal = 'new'; }
                     if (body.indexOf('cardInfo=') === -1) {
                         body += '&cardInfo=' + encodeURIComponent(cardInfoVal);
                     }

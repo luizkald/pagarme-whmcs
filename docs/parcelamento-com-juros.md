@@ -63,29 +63,70 @@ Não há conflito: as injeções não aparecem ao mesmo tempo.
 > restante; confirme que a fatura fecha exatamente em zero, sem saldo residual
 > nem pagamento duplicado.
 
-## Limitação conhecida: cartão salvo no pedido novo (Lagom Smart Order Form)
+## Problema em aberto: cartão salvo no pedido novo (Lagom Smart Order Form)
 
-Ao criar um PEDIDO NOVO usando um cartão já salvo, o Lagom Smart Order Form
-exibe o erro "O número do cartão que você digitou não é válido" e não envia o
-formulário. Isso é uma validação **client-side do próprio Lagom** (frontend Vue
-da RS Studio/ModulesGarden), que dispara antes do envio quando o campo de número
-de cartão está vazio — situação normal ao usar um cartão salvo.
+Ao criar um PEDIDO NOVO usando um cartão já salvo, aparece o erro "O número do
+cartão que você digitou não é válido" e o pedido não conclui.
 
-Como a validação ocorre no navegador, antes de qualquer requisição ao servidor,
-o módulo PHP não tem como interceptá-la. Confirmado: nesse cenário nenhuma linha
-aparece no Gateway Log (nada chega ao backend).
+### Diagnóstico correto (revisado em 30/07/2026)
 
-Decisão de projeto: NÃO tratar isso no módulo. Impacto real é pequeno —
-- Pedido novo: o cliente digita o cartão uma vez (fluxo normal de primeira compra).
-- Renovações (via fatura): o cartão salvo funciona normalmente.
+Uma versão anterior deste doc atribuía o erro a uma validação client-side do
+Lagom, afirmando que nada chegava ao backend. **Isso estava errado.** Captura de
+XHR no navegador (staging, produto Bienal, cliente 157) mostra que:
 
-Caminhos possíveis caso, no futuro, seja necessário suportar cartão salvo já no
-pedido novo:
-- Criar um gateway dedicado ao fluxo tokenizado (como a Cielo faz com
-  `lknc_cielo_credit_card_token`), reconhecido pelo Lagom como gateway de
-  tokenização.
-- Abrir chamado com o suporte do Lagom/ModulesGarden (é comportamento do produto
-  deles).
+1. O Lagom ENVIA a requisição para `cart.php?a=checkout`, com
+   `paymentmethod=pagarme` e `ccinfo=<id do cartão salvo>` — o `ccinfo` é o
+   campo padrão do WHMCS para escolher um pay method existente.
+2. O POST não contém `ccnumber`, `cccvv` nem `ccexpiry*` (correto para cartão
+   salvo).
+3. **O próprio WHMCS responde** (HTTP 200) com
+   `<li>O número do cartão que você digitou não é válido`.
+
+Ou seja: a rejeição é do WHMCS core, ANTES de chamar o módulo — por isso o
+Gateway Log fica vazio (esta parte da observação original estava certa; errada
+era a conclusão de que nada chegava ao servidor).
+
+Hipótese de trabalho: o WHMCS não resolve o `ccinfo` recebido como um pay method
+válido do cliente e, ao não reconhecê-lo, cai no caminho de "cartão novo" e
+valida o número — que está vazio.
+
+**O CVV está descartado como causa.** O caminho de cartão salvo do módulo
+(`pagarme_capture`, cenário `gatewayid`) monta o payload com `customer_id` +
+`card_id` e não envia CVV; é o mesmo caminho usado no pagamento de fatura, que
+funciona. O campo de CVV que aparece na tela de fatura é renderizado pelo WHMCS
+mas ignorado pelo módulo nesse fluxo.
+
+### Hipóteses descartadas
+
+- **CVV ausente**: ver acima; o caminho de cartão salvo não usa CVV.
+- **Cartão salvo por outro gateway**: testado com cartões criados na própria
+  Pagar.me; o erro persiste.
+- **Gateway dedicado ao fluxo tokenizado**: a Cielo tokenizada
+  (`lknc_cielo_credit_card_token`), que já é um gateway desse tipo, **falha da
+  mesma forma** neste order form. Ou seja, o problema não é do registro do
+  gateway e criar um módulo dedicado não resolveria.
+
+Conclusão: é comportamento do WHMCS + Lagom no order form, fora do alcance de
+qualquer módulo de gateway. Cabe chamado ao suporte do Lagom/ModulesGarden.
+
+### Contorno implementado
+
+`enforceNewCardOnly()` em `includes/hooks/pagarme_installments_selector.php`
+oculta a aba "Usar cartão existente" e ativa "Digite informações do novo cartão"
+**apenas na montagem do pedido** (flag `IS_ORDER_FORM`, derivada da URI no PHP).
+Se o clique de troca de aba não surtir efeito, a lista de cartões salvos é
+escondida como fallback — a aba de cartão novo continua visível e clicável, sem
+deixar o painel sem saída.
+
+Não afeta:
+- pagamento de fatura (cartão salvo segue funcionando, com parcelamento);
+- renovação automática pelo cron (`capture` com `gatewayid`), que não passa por
+  esta tela;
+- os demais gateways, pois tudo é escopado em `#mg-gateway-form-pagarme`.
+
+Impacto residual: em PEDIDO NOVO o cliente digita o cartão uma vez, mesmo já
+tendo um salvo. O cartão é tokenizado no ato (`storeremote`), então as
+renovações seguintes são automáticas.
 
 O parcelamento (seletor + juros) funciona normalmente no pedido novo com cartão
 NOVO e nas faturas, inclusive com cartão salvo.
