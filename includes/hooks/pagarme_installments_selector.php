@@ -10,16 +10,21 @@
  *   - Anual       : até 12x; 1x-5x sem juros, 6x-12x com juros
  *   - Bienal      : até 12x; 1x-5x sem juros, 6x-12x com juros
  *   - Trienal     : até 12x; 1x-6x sem juros, 7x-12x com juros
- *   - Juros (taxa da adquirente + margem) repassado ao comprador acima da
- *     faixa sem juros, exibindo o valor de cada parcela e a taxa total
- *   - Posta o campo 'pagarme_installments' (com fallback por cookie, pois o
- *     Lagom serializa apenas campos pré-definidos)
+ *   - Juros (taxa MDR da Pagar.me, SEM margem da loja) repassado ao comprador
+ *     acima da faixa sem juros, exibindo o valor de cada parcela
+ *   - Posta o campo 'pagarme_installments'
  *
  * Coexiste com a injeção da Cielo: cada uma ativa apenas quando o SEU gateway
  * está selecionado (GATEWAY_KEY).
  *
- * IMPORTANTE: as taxas em inc/pagarme_credit_card_taxes.json são um CLONE das
- * taxas da Cielo (placeholder). Trocar pelas taxas reais da Pagar.me.
+ * ESCOPO: este hook só roda na área do cliente do WHMCS. Os checkouts headless
+ * (checkout-staycloud e staycloud-frontned) consomem a API e nunca o executam -
+ * lá o parcelamento vem de GetPagarmeInstallments.
+ *
+ * FONTE DAS REGRAS: este hook CARREGA `modules/gateways/pagarme/installments.php`
+ * e deriva dele o teto e a faixa sem juros de cada ciclo. Não escreva esses
+ * valores à mão aqui - divergir do módulo faz o cliente ver um valor e ser
+ * cobrado outro. Ao JavaScript resta só a aritmética de exibição.
  *
  * Instalação: copiar para /includes/hooks/ na raiz do WHMCS.
  */
@@ -44,19 +49,24 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return '';
     }
 
-    // É a montagem do pedido (order form do Lagom) e não uma fatura? Só nela o
-    // cartão salvo precisa ser ocultado - ver bloco IS_ORDER_FORM no JS abaixo.
-    $isOrderForm = false;
-    foreach (array('cart.php', '/store/', '/order') as $p) {
-        if (strpos($uri, $p) !== false) { $isOrderForm = true; break; }
+    // Carrega a lógica do módulo. Sem isto, este hook precisaria reimplementar
+    // as regras de parcelamento em PHP E em JavaScript - três cópias no total,
+    // livres para divergirem entre si sem ninguém perceber.
+    $moduleRoot = dirname(dirname(__DIR__)) . '/modules/gateways/pagarme';
+    if (!function_exists('pagarme_maxInstallmentsForMonths')
+        && is_readable($moduleRoot . '/installments.php')) {
+        require_once $moduleRoot . '/installments.php';
     }
-    foreach (array('viewinvoice.php', '/invoice/') as $p) {
-        if (strpos($uri, $p) !== false) { $isOrderForm = false; break; }
-    }
-    $isOrderFormJs = $isOrderForm ? 'true' : 'false';
 
-    // Carrega tabelas de taxa/margem server-side (evita fetch bloqueado por .htaccess)
-    $incPath = dirname(dirname(__DIR__)) . '/modules/gateways/pagarme/inc';
+    // Sem o módulo não há como calcular nada de forma confiável; melhor não
+    // renderizar seletor do que exibir um valor que não será o cobrado.
+    if (!function_exists('pagarme_maxInstallmentsForMonths')) {
+        return '';
+    }
+
+    // Carrega a tabela de taxas server-side (evita fetch bloqueado por .htaccess).
+    // A margem da loja NÃO é mais usada - ver pagarme_customerRate().
+    $incPath = $moduleRoot . '/inc';
 
     $feesJson = '{}';
     $f = $incPath . '/pagarme_credit_card_taxes.json';
@@ -67,14 +77,30 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         }
     }
 
-    $marginsJson = '{}';
-    $m = $incPath . '/stay_margins.json';
-    if (is_readable($m)) {
-        $d = json_decode(file_get_contents($m), true);
-        if (json_last_error() === JSON_ERROR_NONE && is_array($d)) {
-            $marginsJson = json_encode($d, JSON_UNESCAPED_UNICODE);
+    // Teto e faixa sem juros por ciclo, DERIVADOS DO MÓDULO em vez de repetidos
+    // em JavaScript. Antes eram duas tabelas escritas à mão aqui, que podiam
+    // divergir das regras reais sem ninguém perceber - e divergir significa
+    // exibir um valor e cobrar outro.
+    $cycleRules = array();
+    if (function_exists('pagarme_cycleToMonths')) {
+        foreach (array(
+            'free'          => 0,
+            'onetime'       => 12,
+            'monthly'       => 1,
+            'quarterly'     => 3,
+            'semiannually'  => 6,
+            'semi-annually' => 6,
+            'annually'      => 12,
+            'biennially'    => 24,
+            'triennially'   => 36,
+        ) as $cycle => $months) {
+            $cycleRules[$cycle] = array(
+                'max'  => $months > 0 ? pagarme_maxInstallmentsForMonths($months) : 1,
+                'free' => $months > 0 ? pagarme_freeInstallmentsForMonths($months) : 1,
+            );
         }
     }
+    $cycleRulesJson = json_encode($cycleRules, JSON_UNESCAPED_UNICODE);
 
     // Máximo de parcelas e faixa sem juros server-side quando é página de
     // fatura (consulta ciclo)
@@ -86,47 +112,28 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
     } elseif (preg_match('#viewinvoice\.php.*[?&]id=(\d+)#', $uri, $mm)) {
         $invoiceId = (int) $mm[1];
     }
-    if ($invoiceId > 0 && function_exists('pagarme_maxInstallmentsForInvoice')) {
-        $serverMax  = (int) pagarme_maxInstallmentsForInvoice($invoiceId);
-        $serverFree = (int) pagarme_freeInstallmentsForInvoice($invoiceId);
-    } elseif ($invoiceId > 0) {
-        // Fallback: replica o cálculo sem depender do módulo estar incluído
+    if ($invoiceId > 0) {
+        // Direto do módulo — mesma fonte que o _capture usa para cobrar.
         try {
-            $inv = localAPI('GetInvoice', array('invoiceid' => $invoiceId));
-            $cycleMap = array('monthly'=>1,'quarterly'=>3,'semiannually'=>6,'semi-annually'=>6,'annually'=>12,'biennially'=>24,'triennially'=>36);
-            $minM = 0; $found = false;
-            if (!empty($inv['items']['item'])) {
-                $items = $inv['items']['item'];
-                if (isset($items['id'])) $items = array($items);
-                foreach ($items as $it) {
-                    $relid = isset($it['relid']) ? (int)$it['relid'] : 0;
-                    if ($relid <= 0) continue;
-                    $table = (isset($it['type']) && $it['type']==='Addon') ? 'tblhostingaddons' : 'tblhosting';
-                    $svc = \WHMCS\Database\Capsule::table($table)->where('id',$relid)->first();
-                    if ($svc && !empty($svc->billingcycle)) {
-                        $mo = isset($cycleMap[strtolower($svc->billingcycle)]) ? $cycleMap[strtolower($svc->billingcycle)] : 0;
-                        if ($mo>0) { $found=true; if($minM===0||$mo<$minM)$minM=$mo; }
-                    }
-                }
-            }
-            if ($found) {
-                // Teto de parcelas por ciclo
-                if ($minM<=1) $serverMax=1; elseif($minM<=3)$serverMax=3; elseif($minM<=6)$serverMax=6; else $serverMax=12;
-                // Faixa sem juros por ciclo (ver pagarme_freeInstallmentsForMonths)
-                if ($minM<=1) $serverFree=1; elseif($minM<=3)$serverFree=1; elseif($minM<=6)$serverFree=3; elseif($minM<=24)$serverFree=5; else $serverFree=6;
-            }
-        } catch (\Throwable $e) { $serverMax = 0; $serverFree = 0; }
+            $serverMax  = (int) pagarme_maxInstallmentsForInvoice($invoiceId);
+            $serverFree = (int) pagarme_freeInstallmentsForInvoice($invoiceId);
+        } catch (\Throwable $e) {
+            $serverMax = 0;
+            $serverFree = 0;
+        }
     }
 
     return <<<HTML
 <script>
 (function () {
     var GATEWAY_KEY = '{$gatewayKey}';
-    var IS_ORDER_FORM = {$isOrderFormJs};
     var SERVER_MAX = {$serverMax};
     var SERVER_FREE = {$serverFree};
     var FEES = {$feesJson};
-    var MARGINS = {$marginsJson};
+    // Teto e faixa sem juros por ciclo, gerados pelo módulo PHP. Não editar
+    // valores aqui: a fonte é pagarme_maxInstallmentsForMonths() /
+    // pagarme_freeInstallmentsForMonths().
+    var CYCLE_RULES = {$cycleRulesJson};
 
     function fmt(v){ return v.toFixed(2).replace('.', ','); }
     function parseMoney(t){
@@ -139,18 +146,6 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
 
     // Faixa sem juros por ciclo (meses do billingcycle). Espelha
     // pagarme_freeInstallmentsForMonths() do módulo PHP: mensal/trimestral
-    // 1x, semestral 3x, anual/bienal 5x, trienal+ 6x.
-    var FREE_BY_CYCLE = {
-        free: 1, onetime: 5, monthly: 1, quarterly: 1,
-        semiannually: 3, 'semi-annually': 3,
-        annually: 5, biennially: 5, triennially: 6
-    };
-    // Teto de parcelas por ciclo. Espelha pagarme_maxInstallmentsForMonths().
-    var MAX_BY_CYCLE = {
-        free: 1, onetime: 12, monthly: 1, quarterly: 3,
-        semiannually: 6, 'semi-annually': 6,
-        annually: 12, biennially: 12, triennially: 12
-    };
 
     function detectBrand(num){
         num=(num||'').replace(/\D/g,'');
@@ -185,13 +180,12 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return 'outras';
     }
 
+    // Espelha pagarme_customerRate(): só a taxa MDR, sem margem da loja.
+    // Qualquer divergência aqui faz o cliente ver um valor e ser cobrado outro.
     function getRate(brand, n, free){
         if(n<=free) return 0;
         var bt=(FEES[brand]&&FEES[brand].credito)||(FEES.outras&&FEES.outras.credito)||{};
-        var mt=(MARGINS.credito)||{};
-        var fee=parseFloat(bt[n])||0;
-        var mar=parseFloat(mt[n])||0;
-        return fee+mar;
+        return parseFloat(bt[n])||0;
     }
 
     function getTotal(){
@@ -247,63 +241,23 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return cycleFromSummary();
     }
 
+    // Numa fatura, SERVER_* vem do próprio módulo e é autoritativo. No carrinho
+    // ainda não há fatura, então o ciclo é lido do DOM e resolvido pela tabela
+    // que o PHP gerou.
+    function cycleRule(key, fallback){
+        if(!CYCLE_RULES) return fallback;
+        var rule=CYCLE_RULES[currentCycleValue()];
+        return (rule && rule[key]!==undefined) ? rule[key] : fallback;
+    }
+
     function maxAllowed(){
         if(SERVER_MAX>0) return SERVER_MAX;
-        var v=currentCycleValue();
-        if(MAX_BY_CYCLE[v]!==undefined) return MAX_BY_CYCLE[v];
-        return 12;
+        return cycleRule('max', 1);
     }
 
     function freeAllowed(){
         if(SERVER_FREE>0) return SERVER_FREE;
-        var v=currentCycleValue();
-        if(FREE_BY_CYCLE[v]!==undefined) return FREE_BY_CYCLE[v];
-        return 1;
-    }
-
-    // Na MONTAGEM DO PEDIDO, cartão salvo não conclui: o Lagom posta
-    // 'ccinfo=<id do pay method>' e o WHMCS core recusa antes de chamar o
-    // módulo, respondendo "O número do cartão que você digitou não é válido"
-    // (comprovado por captura de XHR; ocorre também com a Cielo tokenizada,
-    // ou seja, não é específico deste gateway). Como oferecer uma opção que
-    // não finaliza o pedido só gera chamado de suporte, escondemos a aba e
-    // deixamos apenas "cartão novo".
-    //
-    // Escopo: SOMENTE o order form. Na fatura o cartão salvo funciona
-    // normalmente e não é tocado - assim como a renovação automática pelo
-    // cron, que nem passa por esta tela.
-    function enforceNewCardOnly(){
-        if(!IS_ORDER_FORM) return;
-        var panel=document.querySelector('#mg-gateway-form-'+GATEWAY_KEY);
-        if(!panel) return;
-        var exRadio=panel.querySelector('input[name="cardInfo"][value="existing"]');
-        var nwRadio=panel.querySelector('input[name="cardInfo"][value="new"]');
-        if(!exRadio||!nwRadio) return;
-        var exLi=exRadio.closest('.nav-item'), nwLi=nwRadio.closest('.nav-item');
-        if(!exLi||!nwLi) return;
-
-        exLi.style.display='none';
-
-        // Já está na aba de cartão novo: nada mais a fazer.
-        if(!exLi.classList.contains('active')) return;
-
-        if(exLi.dataset.pgmSwitch==='1'){
-            // O clique não trocou a aba (Vue não reagiu). Esconde a lista de
-            // cartões salvos para não oferecer algo que será recusado.
-            var lista=panel.querySelector('.cc-input-container');
-            if(lista) lista.style.display='none';
-            return;
-        }
-        exLi.dataset.pgmSwitch='1';
-
-        // O <a> tem href="" e recarregaria a página; o preventDefault em fase
-        // de captura evita isso sem impedir o handler do Vue (preventDefault
-        // não interrompe outros listeners).
-        var alvo=nwLi.querySelector('a')||nwLi;
-        try{
-            alvo.addEventListener('click',function(e){ e.preventDefault(); },{capture:true,once:true});
-            alvo.click();
-        }catch(e){}
+        return cycleRule('free', 1);
     }
 
     function setInstallmentValue(v){
@@ -325,7 +279,6 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
 
     function buildOrUpdate(){
         if(!isPagarmeSelected()){ removeIt(); return; }
-        enforceNewCardOnly();
         var total=getTotal();
         var maxInst=maxAllowed();
         var free=freeAllowed();
@@ -438,10 +391,6 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
                         || document.querySelector('.nav-item.active input[name="cardInfo"]')
                         || document.querySelector('input[name="cardInfo"]:checked');
                     var cardInfoVal = cardInfoInput ? cardInfoInput.value : 'existing';
-                    // No order form o cartão salvo é recusado pelo WHMCS (ver
-                    // enforceNewCardOnly), então nunca postamos 'existing' ali -
-                    // nem pelo fallback acima, se a aba não for encontrada.
-                    if (IS_ORDER_FORM) { cardInfoVal = 'new'; }
                     if (body.indexOf('cardInfo=') === -1) {
                         body += '&cardInfo=' + encodeURIComponent(cardInfoVal);
                     }

@@ -20,43 +20,110 @@ Implementado em `pagarme_maxInstallmentsForMonths` (teto) e
 `pagarme_freeInstallmentsForMonths` (faixa sem juros), ambas em
 `installments.php`.
 
-O juros (taxa da adquirente + margem da loja) é repassado ao comprador e
-adicionado como item na fatura, para que o total cobrado bata com a
-contabilidade do WHMCS.
+O juros é a **taxa MDR da Pagar.me**, repassada ao comprador e adicionada como
+item na fatura, para que o total cobrado bata com a contabilidade do WHMCS.
+
+**Sem margem da loja.** A margem de `stay_margins.json` existia para cobrir o
+custo de antecipar recebíveis; como a Stay não antecipa (recebe parcela a
+parcela), o custo real do parcelamento é o próprio MDR. O arquivo permanece no
+repositório como histórico e **não é mais lido**.
+
+### Base de cálculo
+
+O juros incide sobre `pagarme_invoiceBaseAmount()` — o saldo da fatura **menos**
+o item `[PARCELAMENTO]` de uma tentativa anterior. Usar o total da fatura aqui
+faria o juros incidir sobre o próprio juros a cada retentativa.
+
+Quando uma nova tentativa cai numa faixa **sem** juros, o item de taxa anterior é
+removido (`pagarme_clearInstallmentFee()`) e o total volta à base — senão a
+fatura ficaria permanentemente inflada.
 
 ## Arquivos
 
-- `modules/gateways/pagarme/installments.php` — lógica de teto por ciclo, taxa,
-  reconciliação da fatura
-- `modules/gateways/pagarme/inc/pagarme_credit_card_taxes.json` — **CLONE das
-  taxas da Cielo (placeholder)**. Substituir pelas taxas reais da Pagar.me.
-- `modules/gateways/pagarme/inc/stay_margins.json` — margens da loja por parcela
-- `includes/hooks/pagarme_installments_selector.php` — seletor no checkout/fatura
+- `modules/gateways/pagarme/installments.php` — regras por ciclo, cálculo de
+  taxa, montagem das opções, reconciliação da fatura e persistência da escolha
+- `modules/gateways/pagarme/inc/pagarme_credit_card_taxes.json` — MDR por
+  bandeira e número de parcelas. Conferido contra a proposta comercial.
+- `modules/gateways/pagarme/inc/stay_margins.json` — **não utilizado**; mantido
+  só como histórico
+- `includes/api/` — custom API actions `GetPagarmeInstallments` e
+  `SetPagarmeInstallments`, que expõem o parcelamento para os checkouts
+  headless. Ver `includes/api/README.md` (instalação e registro).
+- `includes/hooks/pagarme_installments_selector.php` — seletor na área do
+  cliente do WHMCS. **Não executa** nos checkouts headless.
 
-## Taxas — AÇÃO NECESSÁRIA
+## Taxas — conferidas (03/08/2026)
 
-As tabelas em `inc/` são um **clone das taxas da Cielo**, só para o staging
-funcionar. Quando o dono da conta passar as taxas reais da Pagar.me (por
-bandeira e por número de parcelas), edite `pagarme_credit_card_taxes.json`
-mantendo a mesma estrutura. As margens (`stay_margins.json`) são política
-comercial da loja e podem permanecer.
+`inc/pagarme_credit_card_taxes.json` bate exatamente com as condições acordadas
+na proposta comercial Stone/Pagar.me:
+
+| Bandeira | À vista | 2-6x | 7-12x |
+|---|---|---|---|
+| Mastercard | 1,87% | 2,29% | 3,82% |
+| Visa | 1,97% | 2,29% | 3,82% |
+| Elo | 2,40% | 2,65% | 3,82% |
+| Amex | 2,40% | 2,65% | 3,82% |
+
+`outras` (Hipercard, Diners e bandeiras não listadas) usa 2,40/2,65/3,82 — a
+faixa mais cara entre as acordadas, portanto conservadora.
+
+O rótulo de "clone das taxas da Cielo" que constava no código era resíduo do
+início do projeto e estava errado; foi corrigido.
+
+> **Confirmar com a Pagar.me antes do go-live:** que a conta está como
+> **parcelado lojista** e não soma juros por cima do valor enviado. Nós já
+> embutimos o juros no total; se a Pagar.me também somar, o cliente paga duas
+> vezes. Este é o modelo necessário porque as faixas sem juros variam por ciclo,
+> e a configuração de parcelamento da Pagar.me é global (uma só para a conta).
+
+## Como a escolha de parcelas chega ao módulo
+
+| Origem | Canal | Onde se aplica |
+|---|---|---|
+| Área do cliente do WHMCS | `$_REQUEST['pagarme_installments']` (hook) | Fluxo legado |
+| Checkouts headless | Registro em `mod_pagarme_installments` via `SetPagarmeInstallments` | checkout-staycloud, staycloud-frontned |
+
+O fallback por **cookie foi removido**: não funciona em chamada de API e podia
+aplicar a escolha de uma fatura a outra.
+
+Uma seleção persistida **expirada ou defasada** (fatura mudou de valor depois da
+escolha) resulta em **recusa** com pedido de refazer a escolha. Nunca em
+cobrança silenciosa à vista — isso cobraria o cliente num plano diferente do que
+ele aceitou.
 
 ## Coexistência com a Cielo
 
 Cada seletor ativa só quando o SEU gateway está selecionado:
 - Cielo: `lknc_cielo_credit_card_token` → posta `lknc_installment`
-- Pagar.me: `pagarme` → posta `pagarme_installments` (com fallback por cookie)
+- Pagar.me: `pagarme` → posta `pagarme_installments`
 
 Não há conflito: as injeções não aparecem ao mesmo tempo.
 
 ## Validação recomendada no staging
 
+Regras e reconciliação:
+
 1. Fatura anual, 5x → sem juros, total inalterado, `capture: pago`, installments=5
 2. Fatura anual, 8x → com juros: aparece item "[PARCELAMENTO] Taxa..." na fatura,
-   total maior, fatura fecha em zero
+   total maior, fatura fecha **exatamente em zero**
 3. Fatura trimestral, 3x → com juros (só 1x é sem juros nesse ciclo)
 4. Cartão salvo (token) → o parcelamento também deve funcionar
 5. Conferir no painel Pagar.me que o campo Parcelas reflete o escolhido
+
+Regressões que já foram bugs (não remover destes testes):
+
+6. **Juros não compõe**: recusa em 8x, repete em 8x → o item de taxa mantém o
+   MESMO valor. Antes, a taxa incidia sobre base+taxa a cada tentativa.
+7. **Taxa órfã**: depois da falha em 8x, repete em 4x (sem juros) → o item
+   `[PARCELAMENTO]` é REMOVIDO e o total volta à base. Antes, o item ficava e a
+   fatura seguia inflada.
+
+API (ver `includes/api/README.md`):
+
+8. `GetPagarmeInstallments` em fatura anual → `max=12`, `free=5`
+9. Modo preview com o mesmo ciclo e valor → opções idênticas ao modo invoice
+10. `SetPagarmeInstallments` com `expected_total` errado → `total_mismatch`, sem
+    cobrança
 
 > Ponto que merece atenção especial no teste: a reconciliação da fatura quando
 > há juros (itens 2 e 3). O módulo aplica a parcela do juros e o WHMCS aplica o
@@ -109,24 +176,15 @@ mas ignorado pelo módulo nesse fluxo.
 Conclusão: é comportamento do WHMCS + Lagom no order form, fora do alcance de
 qualquer módulo de gateway. Cabe chamado ao suporte do Lagom/ModulesGarden.
 
-### Contorno implementado
+### Contorno REMOVIDO (03/08/2026)
 
-`enforceNewCardOnly()` em `includes/hooks/pagarme_installments_selector.php`
-oculta a aba "Usar cartão existente" e ativa "Digite informações do novo cartão"
-**apenas na montagem do pedido** (flag `IS_ORDER_FORM`, derivada da URI no PHP).
-Se o clique de troca de aba não surtir efeito, a lista de cartões salvos é
-escondida como fallback — a aba de cartão novo continua visível e clicável, sem
-deixar o painel sem saída.
+Houve um `enforceNewCardOnly()` no hook que ocultava a aba "Usar cartão
+existente" no order form. **Foi removido a pedido**: com a migração para os
+checkouts headless, o order form do Lagom sai de cena e o contorno perdeu a
+razão de existir.
 
-Não afeta:
-- pagamento de fatura (cartão salvo segue funcionando, com parcelamento);
-- renovação automática pelo cron (`capture` com `gatewayid`), que não passa por
-  esta tela;
-- os demais gateways, pois tudo é escopado em `#mg-gateway-form-pagarme`.
-
-Impacto residual: em PEDIDO NOVO o cliente digita o cartão uma vez, mesmo já
-tendo um salvo. O cartão é tokenizado no ato (`storeremote`), então as
-renovações seguintes são automáticas.
+Se o order form do WHMCS voltar a ser usado, o problema descrito acima
+reaparece — o registro fica aqui para não se perder o diagnóstico.
 
 O parcelamento (seletor + juros) funciona normalmente no pedido novo com cartão
 NOVO e nas faturas, inclusive com cartão salvo.

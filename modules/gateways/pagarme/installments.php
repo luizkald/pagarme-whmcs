@@ -5,8 +5,8 @@
  * Espelha o modelo do módulo Cielo:
  *   - Máximo de parcelas por ciclo de cobrança
  *   - Faixa sem juros conforme o ciclo
- *   - Juros (taxa da adquirente + margem da loja) repassado ao comprador
- *     acima da faixa sem juros
+ *   - Juros (taxa MDR da Pagar.me) repassado ao comprador acima da faixa
+ *     sem juros
  *   - Reconciliação: o juros é adicionado como item na fatura, para que o
  *     total cobrado seja igual ao total da fatura (contabilidade do WHMCS)
  *
@@ -18,9 +18,13 @@
  *   - Bienal      : 1x a 5x sem juros; 6x a 12x com juros
  *   - Trienal     : 1x a 6x sem juros; 7x a 12x com juros
  *
- * IMPORTANTE: as tabelas em inc/pagarme_credit_card_taxes.json são um CLONE
- * das taxas da Cielo, usadas como placeholder. Substituir pelas taxas reais
- * da conta Pagar.me quando disponíveis.
+ * Taxas: inc/pagarme_credit_card_taxes.json contém as MDR reais da proposta
+ * comercial Stone/Pagar.me, conferidas em 03/08/2026 (Mastercard 1,87/2,29/3,82;
+ * Visa 1,97/2,29/3,82; Elo e Amex 2,40/2,65/3,82, nas faixas 1x, 2-6x e 7-12x).
+ * O rótulo de "placeholder da Cielo" que constava aqui era resíduo do início do
+ * projeto e estava errado.
+ *
+ * A margem da loja NÃO entra no cálculo — ver pagarme_customerRate().
  */
 
 if (!defined('WHMCS')) {
@@ -183,17 +187,29 @@ function pagarme_freeInstallmentsForInvoice($invoiceId)
 /**
  * Carrega uma tabela JSON do diretório inc/ do módulo.
  *
+ * O resultado fica em cache estático: pagarme_buildInstallmentOptions() chama
+ * pagarme_customerRate() até 12 vezes em sequência, e sem cache isso seriam 24
+ * leituras de disco para montar uma única lista de parcelas.
+ *
  * @param string $filename
  * @return array
  */
 function pagarme_loadTable($filename)
 {
+    static $cache = array();
+
+    if (array_key_exists($filename, $cache)) {
+        return $cache[$filename];
+    }
+
     $path = __DIR__ . '/inc/' . $filename;
     if (!is_readable($path)) {
-        return array();
+        return $cache[$filename] = array();
     }
     $decoded = json_decode(file_get_contents($path), true);
-    return (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) ? $decoded : array();
+    return $cache[$filename] = (json_last_error() === JSON_ERROR_NONE && is_array($decoded))
+        ? $decoded
+        : array();
 }
 
 /**
@@ -258,14 +274,19 @@ function pagarme_detectBrand($number)
 /**
  * Calcula a taxa (%) repassada ao comprador para um dado número de parcelas.
  *
- * customer = 0 dentro da faixa sem juros; acima dela, taxa da adquirente +
- * margem da loja.
+ * Zero dentro da faixa sem juros; acima dela, a taxa MDR da Pagar.me para
+ * aquela bandeira e número de parcelas.
+ *
+ * NÃO soma margem da loja. A margem de `stay_margins.json` existia para cobrir
+ * o custo de antecipar recebíveis, e a Stay não antecipa: recebe parcela a
+ * parcela, então o custo real do parcelamento é o próprio MDR. O arquivo segue
+ * no repositório apenas como histórico e não é mais lido.
  *
  * @param string $brand            Bandeira normalizada
  * @param int    $installments     Número de parcelas escolhido
  * @param int    $freeInstallments Parcelas sem juros do ciclo (ver
  *                                 pagarme_freeInstallmentsForMonths)
- * @return float Percentual a acrescentar (ex: 3.09 = 3,09%)
+ * @return float Percentual a acrescentar (ex: 3.82 = 3,82%)
  */
 function pagarme_customerRate($brand, $installments, $freeInstallments)
 {
@@ -273,25 +294,385 @@ function pagarme_customerRate($brand, $installments, $freeInstallments)
         return 0.0;
     }
 
-    $fees    = pagarme_loadTable('pagarme_credit_card_taxes.json');
-    $margins = pagarme_loadTable('stay_margins.json');
-
+    $fees  = pagarme_loadTable('pagarme_credit_card_taxes.json');
     $brand = pagarme_normalizeBrand($brand);
 
     $feeTable = array();
     if (isset($fees[$brand]['credito'])) {
         $feeTable = $fees[$brand]['credito'];
     } elseif (isset($fees['outras']['credito'])) {
+        // Bandeiras fora da proposta comercial (Hipercard, Diners...) caem na
+        // faixa mais cara entre as acordadas.
         $feeTable = $fees['outras']['credito'];
     }
 
-    $marginTable = isset($margins['credito']) ? $margins['credito'] : array();
+    $n = (string) $installments;
 
-    $n   = (string) $installments;
-    $fee = isset($feeTable[$n]) ? (float) $feeTable[$n] : 0.0;
-    $mar = isset($marginTable[$n]) ? (float) $marginTable[$n] : 0.0;
+    return isset($feeTable[$n]) ? (float) $feeTable[$n] : 0.0;
+}
 
-    return $fee + $mar;
+/**
+ * Marcador usado na descrição do item de juros na fatura. Único ponto onde
+ * essa string é definida - tudo que procura/insere/remove o item usa daqui.
+ */
+if (!defined('PAGARME_FEE_MARKER')) {
+    define('PAGARME_FEE_MARKER', '[PARCELAMENTO]');
+}
+
+/**
+ * Valor do item de taxa de parcelamento já existente na fatura (0 se não há).
+ *
+ * @param int $invoiceId
+ * @return float
+ */
+function pagarme_existingFeeItemAmount($invoiceId)
+{
+    if (!class_exists('\WHMCS\Database\Capsule') || !$invoiceId) {
+        return 0.0;
+    }
+
+    try {
+        $sum = \WHMCS\Database\Capsule::table('tblinvoiceitems')
+            ->where('invoiceid', $invoiceId)
+            ->where('description', 'like', PAGARME_FEE_MARKER . '%')
+            ->sum('amount');
+        return round((float) $sum, 2);
+    } catch (\Exception $e) {
+        return 0.0;
+    }
+}
+
+/**
+ * Base de cálculo do parcelamento: o que o cliente realmente deve, SEM o juros
+ * de uma tentativa anterior.
+ *
+ * Esta é a única definição de "base" do módulo. Antes, o juros era calculado
+ * sobre $params['amount'], que já vinha inflado pelo item de taxa aplicado em
+ * uma tentativa anterior - o juros incidia sobre juros a cada retentativa.
+ *
+ * @param int $invoiceId
+ * @return float
+ */
+function pagarme_invoiceBaseAmount($invoiceId)
+{
+    if (!class_exists('\WHMCS\Database\Capsule') || !$invoiceId) {
+        return 0.0;
+    }
+
+    try {
+        $invoice = \WHMCS\Database\Capsule::table('tblinvoices')
+            ->where('id', $invoiceId)
+            ->first();
+        if (!$invoice) {
+            return 0.0;
+        }
+
+        // Pagamentos já aplicados (inclui a parcela de juros de tentativas
+        // anteriores, lançada com transid <charge>_fee).
+        $paid = \WHMCS\Database\Capsule::table('tblaccounts')
+            ->where('invoiceid', $invoiceId)
+            ->sum(\WHMCS\Database\Capsule::raw('amountin - amountout'));
+
+        $base = (float) $invoice->total
+            - (float) $paid
+            - pagarme_existingFeeItemAmount($invoiceId);
+
+        return ($base > 0) ? round($base, 2) : 0.0;
+    } catch (\Exception $e) {
+        return 0.0;
+    }
+}
+
+/**
+ * Valor do juros, em reais, para um número de parcelas sobre uma base.
+ *
+ * Único ponto de arredondamento do juros no módulo.
+ *
+ * @param float  $baseAmount
+ * @param string $brand
+ * @param int    $installments
+ * @param int    $freeInstallments
+ * @return float
+ */
+function pagarme_feeForInstallments($baseAmount, $brand, $installments, $freeInstallments)
+{
+    $rate = pagarme_customerRate($brand, $installments, $freeInstallments);
+    if ($rate <= 0) {
+        return 0.0;
+    }
+    return round(((float) $baseAmount) * ($rate / 100), 2);
+}
+
+/**
+ * Monta a lista de opções de parcelamento para um ciclo e uma base.
+ *
+ * PURA: não toca banco nem localAPI. É o núcleo testável do parcelamento e o
+ * que a API pública expõe.
+ *
+ * 'total' é autoritativo (é o que será cobrado). 'installment_amount' é apenas
+ * exibição - quem divide de fato a cobrança é a Pagar.me, que fica com eventual
+ * diferença de centavo na última parcela.
+ *
+ * @param int    $months     Meses do ciclo (ver pagarme_cycleToMonths)
+ * @param float  $baseAmount Base de cálculo em reais
+ * @param string $brand      Bandeira (será normalizada)
+ * @return array
+ */
+function pagarme_buildInstallmentOptions($months, $baseAmount, $brand)
+{
+    $max   = pagarme_maxInstallmentsForMonths($months);
+    $free  = pagarme_freeInstallmentsForMonths($months);
+    $brand = pagarme_normalizeBrand($brand);
+    $base  = round((float) $baseAmount, 2);
+
+    $options = array();
+    for ($n = 1; $n <= $max; $n++) {
+        $rate  = pagarme_customerRate($brand, $n, $free);
+        $fee   = pagarme_feeForInstallments($base, $brand, $n, $free);
+        $total = round($base + $fee, 2);
+
+        $options[] = array(
+            'installments'       => $n,
+            'interest_free'      => ($rate <= 0),
+            'rate'               => round((float) $rate, 4),
+            'fee_amount'         => $fee,
+            'installment_amount' => round($total / $n, 2),
+            'total'              => $total,
+        );
+    }
+
+    return array(
+        'cycle_months'      => (int) $months,
+        'base_amount'       => $base,
+        'brand'             => $brand,
+        'max_installments'  => $max,
+        'free_installments' => $free,
+        'options'           => $options,
+    );
+}
+
+/**
+ * Opções de parcelamento de uma fatura (modo autoritativo).
+ *
+ * @param int    $invoiceId
+ * @param string $brand
+ * @return array
+ */
+function pagarme_installmentOptionsForInvoice($invoiceId, $brand = 'outras')
+{
+    return pagarme_buildInstallmentOptions(
+        pagarme_minMonthsForInvoice($invoiceId),
+        pagarme_invoiceBaseAmount($invoiceId),
+        $brand
+    );
+}
+
+/**
+ * Remove o item de taxa de parcelamento da fatura e recalcula o total.
+ *
+ * Necessário quando uma nova tentativa cai numa faixa SEM juros: o item da
+ * tentativa anterior precisa sair, senão a fatura fica permanentemente inflada.
+ *
+ * @param int $invoiceId
+ * @return bool true se algo foi removido
+ */
+function pagarme_clearInstallmentFee($invoiceId)
+{
+    if (!class_exists('\WHMCS\Database\Capsule') || !$invoiceId) {
+        return false;
+    }
+
+    try {
+        $removed = \WHMCS\Database\Capsule::table('tblinvoiceitems')
+            ->where('invoiceid', $invoiceId)
+            ->where('description', 'like', PAGARME_FEE_MARKER . '%')
+            ->delete();
+
+        if (!$removed) {
+            return false;
+        }
+
+        pagarme_recalculateInvoiceTotal($invoiceId);
+        return true;
+    } catch (\Exception $e) {
+        return false;
+    }
+}
+
+/**
+ * Recalcula tblinvoices.total a partir dos itens + impostos - crédito.
+ *
+ * @param int $invoiceId
+ * @return float|null Novo total, ou null em caso de erro
+ */
+function pagarme_recalculateInvoiceTotal($invoiceId)
+{
+    try {
+        $subtotal = \WHMCS\Database\Capsule::table('tblinvoiceitems')
+            ->where('invoiceid', $invoiceId)
+            ->sum('amount');
+
+        $invoice = \WHMCS\Database\Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
+        if (!$invoice) {
+            return null;
+        }
+
+        $newTotal = (float) $subtotal
+            + (float) $invoice->tax
+            + (float) $invoice->tax2
+            - (float) $invoice->credit;
+
+        \WHMCS\Database\Capsule::table('tblinvoices')
+            ->where('id', $invoiceId)
+            ->update(array('total' => number_format($newTotal, 2, '.', '')));
+
+        return $newTotal;
+    } catch (\Exception $e) {
+        return null;
+    }
+}
+
+// =========================================================================
+// Persistência da parcela escolhida
+//
+// Nos checkouts headless não existe formulário do WHMCS: a escolha do cliente
+// chega por uma chamada de API (SetPagarmeInstallments) e precisa sobreviver
+// até a captura, que é OUTRA requisição. Guardar em $_REQUEST/cookie não serve
+// e falha em silêncio - o cliente escolheria 8x e seria cobrado 1x.
+// =========================================================================
+
+/**
+ * Garante a existência da tabela de seleções. Módulos de gateway do WHMCS não
+ * têm hook de ativação, então criamos sob demanda.
+ *
+ * @return bool
+ */
+function pagarme_ensureInstallmentsTable()
+{
+    static $checked = null;
+    if ($checked !== null) {
+        return $checked;
+    }
+
+    try {
+        $schema = \WHMCS\Database\Capsule::schema();
+        if (!$schema->hasTable('mod_pagarme_installments')) {
+            $schema->create('mod_pagarme_installments', function ($table) {
+                $table->integer('invoiceid')->primary();
+                $table->integer('installments');
+                $table->decimal('base_amount', 12, 2);
+                $table->dateTime('expires_at');
+            });
+        }
+        return $checked = true;
+    } catch (\Exception $e) {
+        return $checked = false;
+    }
+}
+
+/**
+ * Grava a parcela escolhida para uma fatura.
+ *
+ * @param int   $invoiceId
+ * @param int   $installments
+ * @param float $baseAmount   Base usada no cálculo, para detectar fatura alterada
+ * @param int   $ttlSeconds
+ * @return bool
+ */
+function pagarme_storeSelectedInstallments($invoiceId, $installments, $baseAmount, $ttlSeconds = 1800)
+{
+    if (!pagarme_ensureInstallmentsTable()) {
+        return false;
+    }
+
+    $row = array(
+        'installments' => (int) $installments,
+        'base_amount'  => number_format((float) $baseAmount, 2, '.', ''),
+        'expires_at'   => date('Y-m-d H:i:s', time() + (int) $ttlSeconds),
+    );
+
+    try {
+        $table = \WHMCS\Database\Capsule::table('mod_pagarme_installments');
+        if ($table->where('invoiceid', $invoiceId)->exists()) {
+            $table->where('invoiceid', $invoiceId)->update($row);
+        } else {
+            $row['invoiceid'] = (int) $invoiceId;
+            $table->insert($row);
+        }
+        return true;
+    } catch (\Exception $e) {
+        return false;
+    }
+}
+
+/**
+ * Lê a parcela escolhida para uma fatura, validando prazo e base.
+ *
+ * Distinguir "não há escolha" de "há uma escolha que não posso honrar" é
+ * essencial: no primeiro caso 1x é a resposta correta; no segundo, cobrar 1x
+ * significaria cobrar o cliente num plano diferente do que ele viu e aceitou.
+ * Por isso o retorno traz sempre um 'status'.
+ *
+ * @param int $invoiceId
+ * @return array status: none|valid|expired|base_changed|unavailable
+ */
+function pagarme_readStoredInstallments($invoiceId)
+{
+    $empty = array('installments' => null, 'base_amount' => null);
+
+    if (!pagarme_ensureInstallmentsTable()) {
+        return array_merge($empty, array('status' => 'unavailable'));
+    }
+
+    try {
+        $row = \WHMCS\Database\Capsule::table('mod_pagarme_installments')
+            ->where('invoiceid', $invoiceId)
+            ->first();
+    } catch (\Exception $e) {
+        return array_merge($empty, array('status' => 'unavailable'));
+    }
+
+    if (!$row) {
+        return array_merge($empty, array('status' => 'none'));
+    }
+
+    $found = array(
+        'installments' => (int) $row->installments,
+        'base_amount'  => (float) $row->base_amount,
+    );
+
+    if (strtotime($row->expires_at) < time()) {
+        return array_merge($found, array('status' => 'expired'));
+    }
+
+    // A fatura mudou de valor depois da escolha: o parcelamento precisa ser
+    // refeito, senão exibido e cobrado divergem.
+    $currentBase = pagarme_invoiceBaseAmount($invoiceId);
+    if (abs($currentBase - $found['base_amount']) > 0.01) {
+        return array_merge($found, array('status' => 'base_changed'));
+    }
+
+    return array_merge($found, array('status' => 'valid'));
+}
+
+/**
+ * Remove a seleção de uma fatura (após capturar com sucesso).
+ *
+ * @param int $invoiceId
+ * @return void
+ */
+function pagarme_clearStoredInstallments($invoiceId)
+{
+    if (!pagarme_ensureInstallmentsTable()) {
+        return;
+    }
+    try {
+        \WHMCS\Database\Capsule::table('mod_pagarme_installments')
+            ->where('invoiceid', $invoiceId)
+            ->delete();
+    } catch (\Exception $e) {
+        // silencioso: não impede o pagamento já concluído
+    }
 }
 
 /**
@@ -381,12 +762,10 @@ function pagarme_applyInstallmentFee($invoiceId, $feeAmount, $installments)
         return null;
     }
 
-    $marker      = '[PARCELAMENTO]';
+    $marker      = PAGARME_FEE_MARKER;
     $description = $marker . ' Taxa de parcelamento (' . $installments . 'x)';
 
     try {
-        $db = \WHMCS\Database\Capsule::connection();
-
         // Procura item de taxa já existente nesta fatura
         $existing = \WHMCS\Database\Capsule::table('tblinvoiceitems')
             ->where('invoiceid', $invoiceId)
@@ -416,23 +795,7 @@ function pagarme_applyInstallmentFee($invoiceId, $feeAmount, $installments)
             ));
         }
 
-        // Recalcula o total da fatura a partir dos itens
-        $subtotal = \WHMCS\Database\Capsule::table('tblinvoiceitems')
-            ->where('invoiceid', $invoiceId)
-            ->sum('amount');
-
-        $invoice = \WHMCS\Database\Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
-        $credit  = $invoice ? (float) $invoice->credit : 0.0;
-        $tax     = $invoice ? (float) $invoice->tax : 0.0;
-        $tax2    = $invoice ? (float) $invoice->tax2 : 0.0;
-
-        $newTotal = (float) $subtotal + $tax + $tax2 - $credit;
-
-        \WHMCS\Database\Capsule::table('tblinvoices')
-            ->where('id', $invoiceId)
-            ->update(array('total' => number_format($newTotal, 2, '.', '')));
-
-        return $newTotal;
+        return pagarme_recalculateInvoiceTotal($invoiceId);
     } catch (\Exception $e) {
         return null;
     }

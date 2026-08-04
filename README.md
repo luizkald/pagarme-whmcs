@@ -7,9 +7,9 @@ para cobranças recorrentes.
 ## Estrutura de arquivos
 
 ```
-modules/gateway/pagarme.php                        → módulo principal do gateway
-modules/gateway/pagarme/pagarmeapi.php             → cliente HTTP da API Pagar.me
-modules/gateway/callback/pagarme.php               → webhook (confirmação assíncrona)
+modules/gateways/pagarme.php                        → módulo principal do gateway
+modules/gateways/pagarme/pagarmeapi.php             → cliente HTTP da API Pagar.me
+modules/gateways/callback/pagarme.php               → webhook (confirmação assíncrona)
 includes/hooks/suppress_zero_invoice_emails.php    → hook opcional (faturas R$ 0,00)
 ```
 
@@ -53,7 +53,7 @@ Algumas cobranças ficam em análise antifraude (status `processing`) e só são
 confirmadas depois. Configure no painel da Pagar.me:
 
 **Configurações > Webhooks > Nova assinatura**
-- URL: `https://SEUDOMINIO.com/modules/gateway/callback/pagarme.php`
+- URL: `https://SEUDOMINIO.com/modules/gateways/callback/pagarme.php`
 - Eventos: `order.paid`, `order.payment_failed`, `charge.paid`,
   `charge.payment_failed`, `charge.refunded`
 
@@ -127,12 +127,19 @@ prefira uma solução via addon em vez de hook customizado.
 - **PCI-DSS**: como o cartão é digitado diretamente no seu site (sem tokenização
   client-side), seu ambiente precisa estar em conformidade com PCI-DSS — HTTPS
   obrigatório em toda a aplicação e nenhum dado de cartão em log ou banco.
+
+  Este é o modelo **escolhido deliberadamente** (decisão de 03/08/2026): a
+  integração usa apenas a secret key, sem chave pública, então o cartão trafega
+  pelo backend até o WHMCS, que tokeniza via `_storeremote`. **Não "corrigir"
+  isso** trocando por tokenização no navegador sem antes rediscutir a decisão —
+  o PAN cru em `_capture`/`_storeremote` é intencional aqui. A contrapartida é
+  que os checkouts headless que encaminham o cartão entram no mesmo escopo PCI.
 - **Parcelamento com juros por ciclo**: o teto de parcelas e a faixa sem juros
   dependem do ciclo de cobrança do plano (mensal só à vista; trimestral até 3x, todas
   com juros; semestral até 3x sem juros e 4x-6x com juros; anual/bienal até 5x sem
   juros e 6x-12x com juros; trienal até 6x sem juros e 7x-12x com juros). Acima da
-  faixa sem juros, o juros (taxa da adquirente + margem da loja) é repassado ao
-  comprador e reconciliado como item na fatura. Detalhes completos das regras e dos
+  faixa sem juros, o juros (taxa MDR da Pagar.me, **sem** margem da loja) é repassado
+  ao comprador e reconciliado como item na fatura. Detalhes completos das regras e dos
   arquivos envolvidos em `docs/parcelamento-com-juros.md`. Para ativar:
   1. Nas configurações do gateway, marque a opção de parcelamento.
   2. Adicione o seletor de parcelas ao checkout. Em temas que sobrescrevem os

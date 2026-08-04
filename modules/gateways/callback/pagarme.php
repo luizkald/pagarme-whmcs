@@ -9,7 +9,7 @@
  *
  * Configure esta URL no painel da Pagar.me em:
  *   Configurações > Webhooks > Nova assinatura
- *   URL: https://SEUDOMINIO.com/modules/gateway/callback/pagarme.php
+ *   URL: https://SEUDOMINIO.com/modules/gateways/callback/pagarme.php
  *   Eventos: order.paid, order.payment_failed,
  *            charge.paid, charge.payment_failed, charge.refunded
  */

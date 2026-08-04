@@ -78,7 +78,7 @@ function pagarme_config()
                 . 'até 3x (todas com juros); semestral até 6x (1x-3x sem juros, 4x-6x com juros); '
                 . 'anual/bienal até 12x (1x-5x sem juros, 6x-12x com juros); trienal até 12x (1x-6x '
                 . 'sem juros, 7x-12x com juros). Acima da faixa sem juros, o juros (taxa da '
-                . 'adquirente + margem da loja) é repassado ao comprador. Detalhes em '
+                . 'MDR da Pagar.me) é repassado ao comprador. Detalhes em '
                 . 'docs/parcelamento-com-juros.md.',
         ),
         'cpfCustomField' => array(
@@ -144,7 +144,27 @@ function pagarme_capture($params)
     // ---------------------------------------------------------------
     $maxInstallments  = pagarme_maxInstallmentsForInvoice($params['invoiceid']);
     $freeInstallments = pagarme_freeInstallmentsForInvoice($params['invoiceid']);
-    $installments     = pagarme_resolveInstallments($params, $maxInstallments);
+
+    // Seleção obsoleta: o cliente escolheu um parcelamento que não pode mais ser
+    // honrado (expirou, ou a fatura mudou de valor depois da escolha). Cobrar à
+    // vista aqui seria cobrar num plano diferente do que ele aceitou - recusamos
+    // e pedimos que refaça a escolha.
+    if (empty($_REQUEST['pagarme_installments']) && function_exists('pagarme_readStoredInstallments')) {
+        $stored = pagarme_readStoredInstallments($params['invoiceid']);
+        if ($stored['status'] === 'expired' || $stored['status'] === 'base_changed') {
+            pagarme_log($params, array(
+                'status'       => $stored['status'],
+                'installments' => $stored['installments'],
+            ), 'capture: seleção de parcelamento obsoleta');
+            return array(
+                'status'  => 'declined',
+                'rawdata' => 'A seleção de parcelamento expirou ou os valores da fatura mudaram. '
+                    . 'Refaça a escolha de parcelas antes de pagar.',
+            );
+        }
+    }
+
+    $installments = pagarme_resolveInstallments($params, $maxInstallments);
 
     // Diagnóstico: registra o que foi detectado/lido para o parcelamento
     pagarme_log($params, array(
@@ -153,7 +173,7 @@ function pagarme_capture($params)
         'installments'       => $installments,
         'enableInstallments' => isset($params['enableInstallments']) ? $params['enableInstallments'] : '(vazio)',
         'req_pagarme'        => isset($_REQUEST['pagarme_installments']) ? $_REQUEST['pagarme_installments'] : '(ausente)',
-        'cookie_pagarme'     => isset($_COOKIE['pagarme_installments']) ? $_COOKIE['pagarme_installments'] : '(ausente)',
+        'selecao_persistida' => isset($stored['status']) ? $stored['status'] : '(nao consultada)',
     ), 'capture: diagnóstico de parcelamento');
 
     // Bandeira do cartão (para a tabela de taxas). Cartão digitado: pelo BIN.
@@ -165,12 +185,15 @@ function pagarme_capture($params)
         $brand = pagarme_detectBrand(isset($params['cardnum']) ? $params['cardnum'] : '');
     }
 
-    // Juros repassado ao comprador (0 dentro da faixa sem juros)
+    // Base de cálculo: o que o cliente deve SEM o juros de uma tentativa
+    // anterior. Usar $params['amount'] aqui faria o juros incidir sobre o juros
+    // já lançado na fatura a cada retentativa.
+    $baseAmount   = pagarme_invoiceBaseAmount($params['invoiceid']);
     $customerRate = pagarme_customerRate($brand, $installments, $freeInstallments);
     $chargeAmount = $params['amount'];
 
     if ($customerRate > 0) {
-        $feeAmount = round($params['amount'] * ($customerRate / 100), 2);
+        $feeAmount = pagarme_feeForInstallments($baseAmount, $brand, $installments, $freeInstallments);
 
         // Reconciliação: adiciona o juros como item na fatura, para que o
         // total cobrado seja igual ao total da fatura no WHMCS.
@@ -182,6 +205,7 @@ function pagarme_capture($params)
                 'installments' => $installments,
                 'brand'        => $brand,
                 'rate'         => $customerRate,
+                'base'         => $baseAmount,
                 'fee'          => $feeAmount,
                 'new_total'    => $newTotal,
             ), 'capture: juros de parcelamento aplicado');
@@ -197,6 +221,15 @@ function pagarme_capture($params)
                 'rawdata' => 'Não foi possível aplicar a taxa de parcelamento na fatura.',
             );
         }
+    } elseif (pagarme_clearInstallmentFee($params['invoiceid'])) {
+        // Esta tentativa caiu numa faixa SEM juros, mas a fatura ainda carregava
+        // o item de taxa de uma tentativa anterior (ex: falhou em 8x, refez em
+        // 4x). Sem remover, a fatura ficaria inflada para sempre.
+        $chargeAmount = pagarme_invoiceBaseAmount($params['invoiceid']);
+        pagarme_log($params, array(
+            'installments' => $installments,
+            'new_total'    => $chargeAmount,
+        ), 'capture: taxa de parcelamento anterior removida (faixa sem juros)');
     }
 
     $amountCents = (int) round($chargeAmount * 100);
@@ -322,6 +355,12 @@ function pagarme_capture($params)
                     $charge['id'],
                     $chargeAmount - $params['amount']
                 );
+            }
+
+            // A escolha já foi cobrada; o registro não deve sobreviver para uma
+            // eventual fatura futura de mesmo id em ambiente restaurado.
+            if (function_exists('pagarme_clearStoredInstallments')) {
+                pagarme_clearStoredInstallments($params['invoiceid']);
             }
 
             return array(
@@ -723,9 +762,10 @@ function pagarme_resolveInstallments($params, $maxInstallments = null)
         return 1;
     }
 
-    // Valor escolhido pelo cliente. O seletor injetado posta em
-    // 'pagarme_installments'; mantemos fallbacks por robustez, inclusive cookie.
-    $selected = pagarme_readSelectedInstallments();
+    // Valor escolhido pelo cliente.
+    $selected = pagarme_readSelectedInstallments(
+        isset($params['invoiceid']) ? $params['invoiceid'] : 0
+    );
 
     if ($selected < 1) {
         $selected = 1;
@@ -738,25 +778,35 @@ function pagarme_resolveInstallments($params, $maxInstallments = null)
 }
 
 /**
- * Lê o número de parcelas escolhido pelo cliente a partir do request.
+ * Lê o número de parcelas escolhido pelo cliente.
  *
- * O seletor injetado posta 'pagarme_installments'. Como alguns temas (Lagom)
- * serializam apenas campos pré-definidos e descartam selects customizados, há
- * fallback por cookie, espelhando a técnica usada pelo módulo Cielo.
+ * Ordem de prioridade:
+ *   1. $_REQUEST['pagarme_installments'] - área do cliente do WHMCS, onde o
+ *      seletor injetado pelo hook posta o campo junto do formulário.
+ *   2. Registro persistido via SetPagarmeInstallments - checkouts headless,
+ *      onde a escolha chega numa requisição e a cobrança em outra.
+ *   3. 1x.
  *
+ * O fallback por cookie foi removido: não funciona em chamada de API e podia
+ * aplicar a escolha de uma fatura a outra.
+ *
+ * NÃO ler campos de outros gateways (ex: 'lknc_installment' da Cielo, que usa
+ * outro modelo de juros); misturar causaria divergência entre exibido e cobrado.
+ *
+ * @param int $invoiceId
  * @return int
  */
-function pagarme_readSelectedInstallments()
+function pagarme_readSelectedInstallments($invoiceId = 0)
 {
-    // Lê APENAS o nosso campo. NÃO ler campos de outros gateways (ex: a Cielo
-    // usa 'lknc_installment' com outro modelo de juros); misturar causaria
-    // divergência entre o valor exibido e o cobrado.
     if (isset($_REQUEST['pagarme_installments']) && $_REQUEST['pagarme_installments'] !== '') {
         return (int) $_REQUEST['pagarme_installments'];
     }
 
-    if (isset($_COOKIE['pagarme_installments']) && $_COOKIE['pagarme_installments'] !== '') {
-        return (int) $_COOKIE['pagarme_installments'];
+    if ($invoiceId > 0 && function_exists('pagarme_readStoredInstallments')) {
+        $stored = pagarme_readStoredInstallments($invoiceId);
+        if ($stored['status'] === 'valid') {
+            return (int) $stored['installments'];
+        }
     }
 
     return 1;
