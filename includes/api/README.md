@@ -19,12 +19,24 @@ que garante que o valor exibido ao cliente seja o mesmo que será cobrado.
 ## Instalação
 
 1. Copiar os dois `.php` para `<WHMCS_ROOT>/includes/api/`.
-2. **Registrar no catálogo de custom actions** do projeto
-   (`staycloud-frontned/whmcs/custom-actions/custom_api_register.php`).
-3. **Liberar as duas actions no papel de API** usado pelos apps.
+2. **Registrar no catálogo de custom actions.** As entradas já estão em
+   `staycloud-frontned/whmcs/custom-actions/custom_api_register.php`
+   (`getpagarmeinstallments` / `setpagarmeinstallments`) — só falta esse hook
+   estar instalado em `<WHMCS_ROOT>/includes/hooks/custom_api_register.php` no
+   servidor. Ele só roda no hook `AdminAreaPage`, então **precisa de alguém
+   abrir qualquer página do admin do WHMCS pelo menos uma vez** depois de
+   instalado para as duas actions aparecerem no catálogo.
+3. **Liberar as duas actions no papel de API.** Toda action registrada por
+   esse hook nasce com `default: 0` — ou seja, desligada em todos os papéis até
+   alguém marcar manualmente. Vá em **Setup > Staff Management > API Roles**,
+   abra o papel usado pelo identifier/secret dos apps, e marque
+   `GetPagarmeInstallments` e `SetPagarmeInstallments` no grupo "Custom API
+   Actions".
 
-> Pular os passos 2 ou 3 faz a chamada retornar **403 sem mensagem útil** — é o
-> primeiro lugar a checar se a integração "não responde".
+> Pular qualquer um dos passos 2 ou 3 faz a chamada retornar
+> `403 Forbidden` com corpo `{"error":"Não foi possível calcular o
+> parcelamento."}` (do lado do checkout/painel) — o arquivo `.php` sozinho em
+> `includes/api/` **não é suficiente**, mesmo estando no lugar certo.
 
 Nenhuma migração de banco é necessária: a tabela `mod_pagarme_installments` é
 criada sob demanda (módulos de gateway do WHMCS não têm hook de ativação).
