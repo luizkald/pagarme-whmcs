@@ -103,25 +103,18 @@ try {
     // Parcelamento pode estar desligado na configuração do gateway. Devolvemos
     // 'enabled: false' em vez de erro, para o frontend simplesmente não
     // renderizar o seletor sem precisar de uma segunda chamada.
+    //
+    // A ÚNICA fonte de verdade é o campo enableInstallments do próprio
+    // gateway. Havia aqui uma checagem extra em $gw['type'] que nunca foi
+    // confirmada como válida - e o log de captura de pagarme_capture() (que lê
+    // o mesmo enableInstallments por outro caminho, via $params, preenchido
+    // pelo WHMCS direto do banco) provou 'on' num momento em que esta action
+    // devolvia false. Ou seja, aquela checagem extra é que estava sempre
+    // reprovando. Removida.
     $enabled = false;
-    $debugGatewayVars = null; // DIAGNÓSTICO TEMPORÁRIO - ver nota abaixo.
     if (function_exists('getGatewayVariables')) {
         $gw = getGatewayVariables('pagarme');
-        $enabled = (!empty($gw['type']) && !empty($gw['enableInstallments'])
-            && $gw['enableInstallments'] === 'on');
-
-        // DIAGNÓSTICO TEMPORÁRIO (remover depois de confirmar por que 'enabled'
-        // não reflete o checkbox salvo): devolve o array cru de
-        // getGatewayVariables(), com as chaves de secret redigidas, para
-        // conferirmos ao vivo o formato real que o WHMCS devolve nesta
-        // instância - mais confiável do que adivinhar por fora do código-fonte
-        // fechado do WHMCS.
-        $debugGatewayVars = $gw;
-        foreach (array('secretKeyLive', 'secretKeyTest') as $secretField) {
-            if (isset($debugGatewayVars[$secretField])) {
-                $debugGatewayVars[$secretField] = '[redacted]';
-            }
-        }
+        $enabled = (!empty($gw['enableInstallments']) && $gw['enableInstallments'] === 'on');
     }
 
     $brand     = (string) pagarme_apiParam('brand', 'outras');
