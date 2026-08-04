@@ -357,6 +357,19 @@ function pagarme_capture($params)
                 );
             }
 
+            // Registro informativo do custo real (MDR) que a Pagar.me cobrou da
+            // loja nesta cobrança - não altera o total da fatura, só entra como
+            // nota para conciliar com o extrato da Pagar.me.
+            if (function_exists('pagarme_recordTransactionFee')) {
+                pagarme_recordTransactionFee(
+                    $params['invoiceid'],
+                    $charge['id'],
+                    $brand,
+                    $installments,
+                    $chargeAmount
+                );
+            }
+
             // A escolha já foi cobrada; o registro não deve sobreviver para uma
             // eventual fatura futura de mesmo id em ambiente restaurado.
             if (function_exists('pagarme_clearStoredInstallments')) {

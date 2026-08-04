@@ -41,7 +41,8 @@ fatura ficaria permanentemente inflada.
 ## Arquivos
 
 - `modules/gateways/pagarme/installments.php` — regras por ciclo, cálculo de
-  taxa, montagem das opções, reconciliação da fatura e persistência da escolha
+  taxa, montagem das opções, reconciliação da fatura, registro da taxa de
+  transação real (nota da fatura) e persistência da escolha
 - `modules/gateways/pagarme/inc/pagarme_credit_card_taxes.json` — MDR por
   bandeira e número de parcelas. Conferido contra a proposta comercial.
 - `modules/gateways/pagarme/inc/stay_margins.json` — **não utilizado**; mantido
@@ -75,6 +76,32 @@ início do projeto e estava errado; foi corrigido.
 > embutimos o juros no total; se a Pagar.me também somar, o cliente paga duas
 > vezes. Este é o modelo necessário porque as faixas sem juros variam por ciclo,
 > e a configuração de parcelamento da Pagar.me é global (uma só para a conta).
+
+> **Em aberto (04/08/2026):** uma cobrança real em ambiente de teste (Loja de
+> teste da Pagar.me) mostrou MDR efetivo de ~4,49% numa venda 12x, acima dos
+> 3,82% desta tabela. Em conta de teste a Pagar.me costuma aplicar a tabela
+> padrão dela, não a negociada — em investigação se produção bate com a
+> proposta comercial antes de mudar estes números.
+
+### Taxa de transação (MDR real) — registro na fatura, não cobrada do cliente
+
+Distinta do juros de parcelamento acima. O juros é repassado ao cliente **só**
+fora da faixa sem juros do ciclo; a taxa de transação é o custo real que a
+Pagar.me cobra da loja em **qualquer** cobrança de cartão (inclusive 1x à vista
+e dentro da faixa sem juros), usando a tabela cheia (à vista / 2-6x / 7-12x).
+
+Implementada em `pagarme_recordTransactionFee()` (`installments.php`), chamada
+por `pagarme_capture()` a cada cobrança aprovada. Grava uma linha em
+`tblinvoices.notes` (visível no admin do WHMCS, na fatura) com bandeira,
+parcelas, taxa e valor — **não** altera `tblinvoices.total` nem é cobrada do
+cliente; existe só para conciliar com o extrato da Pagar.me. Idempotente por
+`chargeId`: uma nova tentativa de captura para a mesma cobrança não duplica a
+linha.
+
+Calculada sobre o valor bruto efetivamente processado pela Pagar.me
+(`$chargeAmount` — já inclui o juros de parcelamento repassado ao cliente,
+quando houver, porque é sobre esse total que a Pagar.me também desconta o
+MDR).
 
 ## Como a escolha de parcelas chega ao módulo
 
@@ -124,6 +151,10 @@ API (ver `includes/api/README.md`):
 9. Modo preview com o mesmo ciclo e valor → opções idênticas ao modo invoice
 10. `SetPagarmeInstallments` com `expected_total` errado → `total_mismatch`, sem
     cobrança
+11. Após qualquer captura aprovada (inclusive 1x à vista) → nota
+    `[TAXA PAGAR.ME]` aparece em `tblinvoices.notes` com bandeira/parcelas/taxa/
+    valor, e `tblinvoices.total` **não muda**. Repetir a captura da mesma
+    cobrança não duplica a linha.
 
 > Ponto que merece atenção especial no teste: a reconciliação da fatura quando
 > há juros (itens 2 e 3). O módulo aplica a parcela do juros e o WHMCS aplica o

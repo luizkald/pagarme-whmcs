@@ -272,10 +272,43 @@ function pagarme_detectBrand($number)
 }
 
 /**
+ * Taxa MDR real da Pagar.me (%) para uma bandeira e número de parcelas,
+ * conforme a tabela da proposta comercial (à vista / 2-6x / 7-12x).
+ *
+ * Diferente de pagarme_customerRate(): esta NÃO zera dentro da faixa sem
+ * juros. É o custo real que a Pagar.me cobra da loja em QUALQUER cobrança de
+ * cartão, usado tanto para calcular o juros repassado ao cliente (acima da
+ * faixa sem juros) quanto para registrar a taxa de transação real (sempre,
+ * ver pagarme_recordTransactionFee()).
+ *
+ * @param string $brand        Bandeira (será normalizada)
+ * @param int    $installments Número de parcelas
+ * @return float Percentual (ex: 3.82 = 3,82%)
+ */
+function pagarme_mdrRate($brand, $installments)
+{
+    $fees  = pagarme_loadTable('pagarme_credit_card_taxes.json');
+    $brand = pagarme_normalizeBrand($brand);
+
+    $feeTable = array();
+    if (isset($fees[$brand]['credito'])) {
+        $feeTable = $fees[$brand]['credito'];
+    } elseif (isset($fees['outras']['credito'])) {
+        // Bandeiras fora da proposta comercial (Hipercard, Diners...) caem na
+        // faixa mais cara entre as acordadas.
+        $feeTable = $fees['outras']['credito'];
+    }
+
+    $n = (string) $installments;
+
+    return isset($feeTable[$n]) ? (float) $feeTable[$n] : 0.0;
+}
+
+/**
  * Calcula a taxa (%) repassada ao comprador para um dado número de parcelas.
  *
  * Zero dentro da faixa sem juros; acima dela, a taxa MDR da Pagar.me para
- * aquela bandeira e número de parcelas.
+ * aquela bandeira e número de parcelas (pagarme_mdrRate()).
  *
  * NÃO soma margem da loja. A margem de `stay_margins.json` existia para cobrir
  * o custo de antecipar recebíveis, e a Stay não antecipa: recebe parcela a
@@ -294,21 +327,7 @@ function pagarme_customerRate($brand, $installments, $freeInstallments)
         return 0.0;
     }
 
-    $fees  = pagarme_loadTable('pagarme_credit_card_taxes.json');
-    $brand = pagarme_normalizeBrand($brand);
-
-    $feeTable = array();
-    if (isset($fees[$brand]['credito'])) {
-        $feeTable = $fees[$brand]['credito'];
-    } elseif (isset($fees['outras']['credito'])) {
-        // Bandeiras fora da proposta comercial (Hipercard, Diners...) caem na
-        // faixa mais cara entre as acordadas.
-        $feeTable = $fees['outras']['credito'];
-    }
-
-    $n = (string) $installments;
-
-    return isset($feeTable[$n]) ? (float) $feeTable[$n] : 0.0;
+    return pagarme_mdrRate($brand, $installments);
 }
 
 /**
@@ -799,4 +818,96 @@ function pagarme_applyInstallmentFee($invoiceId, $feeAmount, $installments)
     } catch (\Exception $e) {
         return null;
     }
+}
+
+// =========================================================================
+// Taxa de transação (MDR real) - registro interno, não cobrado do cliente
+//
+// Distinto do juros de parcelamento acima: aquele é repassado ao cliente
+// SOMENTE fora da faixa sem juros. Este é o custo real que a Pagar.me cobra
+// da loja em QUALQUER cobrança de cartão (inclusive 1x à vista e dentro da
+// faixa sem juros) - existe só para conciliar com o extrato da Pagar.me.
+// NÃO soma ao total da fatura nem é cobrado do cliente.
+// =========================================================================
+
+if (!defined('PAGARME_TRANSACTION_FEE_MARKER')) {
+    define('PAGARME_TRANSACTION_FEE_MARKER', '[TAXA PAGAR.ME]');
+}
+
+/**
+ * Acrescenta uma linha às notas da fatura (tblinvoices.notes), preservando o
+ * que já existir. Idempotente: se a linha exata já estiver presente (nova
+ * tentativa de captura para a mesma cobrança), não duplica.
+ *
+ * @param int    $invoiceId
+ * @param string $line
+ * @return bool
+ */
+function pagarme_appendInvoiceNote($invoiceId, $line)
+{
+    if (!class_exists('\WHMCS\Database\Capsule') || !$invoiceId || $line === '') {
+        return false;
+    }
+
+    try {
+        $invoice = \WHMCS\Database\Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
+        if (!$invoice) {
+            return false;
+        }
+
+        $existing = (string) $invoice->notes;
+        if (strpos($existing, $line) !== false) {
+            return true; // já registrado nesta fatura
+        }
+
+        $updated = ($existing !== '') ? ($existing . "\n" . $line) : $line;
+
+        \WHMCS\Database\Capsule::table('tblinvoices')
+            ->where('id', $invoiceId)
+            ->update(array('notes' => $updated));
+
+        return true;
+    } catch (\Exception $e) {
+        return false;
+    }
+}
+
+/**
+ * Registra, como nota da fatura, a taxa MDR real que a Pagar.me cobrou da
+ * loja nesta cobrança - pela tabela cheia (pagarme_mdrRate: à vista / 2-6x /
+ * 7-12x), sempre, independente da faixa sem juros do parcelamento repassado
+ * ao cliente. Puramente informativo: não altera tblinvoices.total.
+ *
+ * Calculada sobre o valor bruto realmente processado pela Pagar.me
+ * ($chargeAmount, que já inclui eventual juros de parcelamento repassado ao
+ * cliente - é sobre esse total que a Pagar.me também desconta o MDR).
+ *
+ * @param int    $invoiceId
+ * @param string $chargeId     Id da cobrança na Pagar.me (garante idempotência)
+ * @param string $brand        Bandeira do cartão
+ * @param int    $installments Parcelas efetivamente cobradas
+ * @param float  $chargeAmount Valor bruto processado pela Pagar.me
+ * @return void
+ */
+function pagarme_recordTransactionFee($invoiceId, $chargeId, $brand, $installments, $chargeAmount)
+{
+    $rate = pagarme_mdrRate($brand, $installments);
+    if ($rate <= 0) {
+        return;
+    }
+
+    $fee = round(((float) $chargeAmount) * ($rate / 100), 2);
+
+    $line = sprintf(
+        '%s cobrança %s: %s %dx, MDR %s%% sobre R$ %s = R$ %s',
+        PAGARME_TRANSACTION_FEE_MARKER,
+        $chargeId,
+        pagarme_normalizeBrand($brand),
+        (int) $installments,
+        number_format($rate, 2, ',', '.'),
+        number_format($chargeAmount, 2, ',', '.'),
+        number_format($fee, 2, ',', '.')
+    );
+
+    pagarme_appendInvoiceNote($invoiceId, $line);
 }
