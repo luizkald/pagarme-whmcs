@@ -83,25 +83,29 @@ início do projeto e estava errado; foi corrigido.
 > padrão dela, não a negociada — em investigação se produção bate com a
 > proposta comercial antes de mudar estes números.
 
-### Taxa de transação (MDR real) — registro na fatura, não cobrada do cliente
+### Taxa de transação (MDR real) — campo nativo do WHMCS, não cobrada do cliente
 
 Distinta do juros de parcelamento acima. O juros é repassado ao cliente **só**
 fora da faixa sem juros do ciclo; a taxa de transação é o custo real que a
 Pagar.me cobra da loja em **qualquer** cobrança de cartão (inclusive 1x à vista
-e dentro da faixa sem juros), usando a tabela cheia (à vista / 2-6x / 7-12x).
+e dentro da faixa sem juros), usando a tabela cheia (à vista / 2-6x / 7-12x —
+`pagarme_transactionFeeAmount()` em `installments.php`).
 
-Implementada em `pagarme_recordTransactionFee()` (`installments.php`), chamada
-por `pagarme_capture()` a cada cobrança aprovada. Grava uma linha em
-`tblinvoices.notes` (visível no admin do WHMCS, na fatura) com bandeira,
-parcelas, taxa e valor — **não** altera `tblinvoices.total` nem é cobrada do
-cliente; existe só para conciliar com o extrato da Pagar.me. Idempotente por
-`chargeId`: uma nova tentativa de captura para a mesma cobrança não duplica a
-linha.
+Vai para o campo **nativo** de taxa de transação do WHMCS: `_capture()` retorna
+a chave `'fee'` (contrato documentado da WHMCS para módulos de gateway), que o
+próprio WHMCS grava em `tblaccounts.fees` ao aplicar o pagamento — a coluna
+"Taxas da Transação" que já aparece na aba Resumo da fatura (mesmo lugar que a
+Cielo usa). **Não** altera `tblinvoices.total` nem é cobrada do cliente; existe
+só para bater com o extrato da Pagar.me e alimentar os relatórios nativos do
+WHMCS (Relatórios > Pagamentos, bruto/taxas/líquido).
 
 Calculada sobre o valor bruto efetivamente processado pela Pagar.me
 (`$chargeAmount` — já inclui o juros de parcelamento repassado ao cliente,
 quando houver, porque é sobre esse total que a Pagar.me também desconta o
-MDR).
+MDR). Quando há juros, o valor é rateado entre as duas parcelas do pagamento
+(a aplicada automaticamente pelo WHMCS via `'fee'` e a do juros, aplicada por
+`pagarme_applyInterestPortion()`) na mesma proporção de cada uma, para que a
+soma bata com o valor real.
 
 ## Como a escolha de parcelas chega ao módulo
 
@@ -151,10 +155,12 @@ API (ver `includes/api/README.md`):
 9. Modo preview com o mesmo ciclo e valor → opções idênticas ao modo invoice
 10. `SetPagarmeInstallments` com `expected_total` errado → `total_mismatch`, sem
     cobrança
-11. Após qualquer captura aprovada (inclusive 1x à vista) → nota
-    `[TAXA PAGAR.ME]` aparece em `tblinvoices.notes` com bandeira/parcelas/taxa/
-    valor, e `tblinvoices.total` **não muda**. Repetir a captura da mesma
-    cobrança não duplica a linha.
+11. Após qualquer captura aprovada (inclusive 1x à vista) → a coluna "Taxas da
+    Transação" da fatura (aba Resumo, tabela Transações) mostra o valor real da
+    MDR na linha da cobrança, e `tblinvoices.total` **não muda**.
+12. Fatura anual, 8x (com juros) → a taxa de transação aparece rateada entre as
+    DUAS linhas de transação (a base e a `_fee` do juros); a soma das duas bate
+    com `pagarme_transactionFeeAmount()` sobre o valor bruto total.
 
 > Ponto que merece atenção especial no teste: a reconciliação da fatura quando
 > há juros (itens 2 e 3). O módulo aplica a parcela do juros e o WHMCS aplica o

@@ -342,6 +342,16 @@ function pagarme_capture($params)
                 'amount'       => $chargeAmount,
             ), 'capture: pago');
 
+            // Taxa de transação (MDR real, tabela cheia à vista/2-6x/7-12x -
+            // ver pagarme_transactionFeeAmount) sobre o valor bruto realmente
+            // processado. É sobre esse total que a Pagar.me também desconta o
+            // MDR, então rateamos entre as duas parcelas do pagamento (base +
+            // juros de parcelamento, se houver) na mesma proporção, para que a
+            // soma das duas bata com o valor real.
+            $transactionFee     = pagarme_transactionFeeAmount($chargeAmount, $brand, $installments);
+            $baseTransactionFee = $transactionFee;
+            $interestFee        = 0.0;
+
             // Se houve juros de parcelamento, o total cobrado é maior que o
             // $params['amount'] original. Já adicionamos o item de juros à
             // fatura (total = amount + juros). Aqui aplicamos SOMENTE a parcela
@@ -350,23 +360,15 @@ function pagarme_capture($params)
             // 'success'. Assim a fatura fecha em zero sem duplicar pagamento,
             // funcione o WHMCS com $params['amount'] ou relendo o saldo.
             if ($chargeAmount > $params['amount']) {
+                if ($transactionFee > 0) {
+                    $baseTransactionFee = round($transactionFee * ($params['amount'] / $chargeAmount), 2);
+                    $interestFee        = round($transactionFee - $baseTransactionFee, 2);
+                }
                 pagarme_applyInterestPortion(
                     $params['invoiceid'],
                     $charge['id'],
-                    $chargeAmount - $params['amount']
-                );
-            }
-
-            // Registro informativo do custo real (MDR) que a Pagar.me cobrou da
-            // loja nesta cobrança - não altera o total da fatura, só entra como
-            // nota para conciliar com o extrato da Pagar.me.
-            if (function_exists('pagarme_recordTransactionFee')) {
-                pagarme_recordTransactionFee(
-                    $params['invoiceid'],
-                    $charge['id'],
-                    $brand,
-                    $installments,
-                    $chargeAmount
+                    $chargeAmount - $params['amount'],
+                    $interestFee
                 );
             }
 
@@ -381,6 +383,7 @@ function pagarme_capture($params)
                 'transid' => $charge['id'],
                 'orderid' => $response['id'],
                 'rawdata' => $response,
+                'fee'     => $baseTransactionFee,
             );
 
         case 'processing':
