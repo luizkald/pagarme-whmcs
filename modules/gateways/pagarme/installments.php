@@ -107,7 +107,23 @@ function pagarme_minMonthsForInvoice($invoiceId)
             continue;
         }
 
-        $table = ($type === 'Addon') ? 'tblhostingaddons' : 'tblhosting';
+        // Só itens de Hosting/Addon têm relid apontando para tblhosting/
+        // tblhostingaddons. Um item de Domínio (type "Domain"/"DomainRegister"/
+        // "DomainTransfer") tem relid de tbldomains, outra tabela, outro
+        // espaço de ids. Sem esta lista, o fallback "senão é tblhosting"
+        // reaproveitava esse relid como id de tblhosting: numa conta nova,
+        // onde os dois ids começam próximos de 1, isso colidia com uma linha
+        // de hospedagem não relacionada e, se o ciclo dela fosse menor,
+        // vencia o MIN() abaixo. Foi assim que uma fatura anual com domínio
+        // junto caiu para "1 mês" e o parcelamento sumiu da tela.
+        $type = strtolower($type);
+        if ($type === 'addon') {
+            $table = 'tblhostingaddons';
+        } elseif ($type === 'hosting') {
+            $table = 'tblhosting';
+        } else {
+            continue;
+        }
 
         try {
             $service = \WHMCS\Database\Capsule::table($table)->where('id', $relid)->first();
