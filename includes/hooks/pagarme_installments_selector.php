@@ -64,37 +64,6 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return '';
     }
 
-    // Carrega a tabela de taxas server-side (evita fetch bloqueado por .htaccess).
-    // A margem da loja NÃO é mais usada - ver pagarme_customerRate().
-    $incPath = $moduleRoot . '/inc';
-
-    $feesJson = '{}';
-    $f = $incPath . '/pagarme_credit_card_taxes.json';
-    if (is_readable($f)) {
-        $d = json_decode(file_get_contents($f), true);
-        if (json_last_error() === JSON_ERROR_NONE && is_array($d)) {
-            $feesJson = json_encode($d, JSON_UNESCAPED_UNICODE);
-        }
-    }
-
-    // Promoções "sem juros" por bandeira (configuradas pelo addon de admin
-    // pagarme_fee_rates). Calculado aqui via pagarme_isPromotionActive() -
-    // mesma função que pagarme_customerRate() usa para a cobrança real -
-    // para não reimplementar a janela de datas em JavaScript. Sem isto, o
-    // seletor mostraria juros durante uma promoção ativa, embora a cobrança
-    // real (e o preview de GetPagarmeInstallments) já estivesse sem juros.
-    $promotionsActive = array();
-    if (function_exists('pagarme_isPromotionActive')) {
-        foreach (array('visa', 'mastercard', 'elo', 'amex', 'outras') as $b) {
-            try {
-                $promotionsActive[$b] = pagarme_isPromotionActive($b);
-            } catch (\Throwable $e) {
-                $promotionsActive[$b] = false;
-            }
-        }
-    }
-    $promotionsJson = json_encode($promotionsActive, JSON_UNESCAPED_UNICODE);
-
     // Teto e faixa sem juros por ciclo, DERIVADOS DO MÓDULO em vez de repetidos
     // em JavaScript. Antes eram duas tabelas escritas à mão aqui, que podiam
     // divergir das regras reais sem ninguém perceber - e divergir significa
@@ -120,6 +89,45 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
     }
     $cycleRulesJson = json_encode($cycleRules, JSON_UNESCAPED_UNICODE);
 
+    // Percentual EFETIVO por bandeira e número de parcelas, pré-calculado no
+    // PHP via pagarme_installmentTotal() - a mesma função central que
+    // pagarme_capture() e GetPagarmeInstallments usam. Substitui a antiga
+    // exportação do JSON de taxas cru (FEES) + reimplementação de juros
+    // simples em JavaScript: agora o modo de cálculo (simples, composto,
+    // com/sem margem, configurado pelo addon pagarme_fee_rates) já vem
+    // embutido no percentual, e o JS só faz a multiplicação final. Sem isto,
+    // esta tela mostraria sempre juros simples mesmo com o modo composto
+    // ativo - exibido divergindo do que a cobrança real calcula.
+    //
+    // Calculado sobre uma base grande (percentual não depende do valor - é
+    // total/base em %; base pequena, tipo R$1, amplifica o arredondamento de
+    // centavo do módulo em erro relativo grande, ~0,5pp em 12x composto) e
+    // para cada combinação bandeira x parcela x ciclo presente em
+    // $cycleRules, usando o 'free' daquele ciclo. Uma parcela pode
+    // legitimamente ter percentuais diferentes em ciclos diferentes (o teto
+    // de parcelas sem juros muda por ciclo), por isso a tabela é aninhada
+    // por ciclo, não só por bandeira.
+    $effectiveRateBase = 10000;
+    $effectiveRates = array();
+    if (function_exists('pagarme_installmentTotal')) {
+        $brands = array('visa', 'mastercard', 'elo', 'amex', 'outras');
+        foreach ($cycleRules as $cycleKey => $rule) {
+            $effectiveRates[$cycleKey] = array();
+            foreach ($brands as $b) {
+                $effectiveRates[$cycleKey][$b] = array();
+                for ($n = 1; $n <= $rule['max']; $n++) {
+                    try {
+                        $r = pagarme_installmentTotal($effectiveRateBase, $b, $n, $rule['free']);
+                        $effectiveRates[$cycleKey][$b][$n] = $r['rate'];
+                    } catch (\Throwable $e) {
+                        $effectiveRates[$cycleKey][$b][$n] = 0;
+                    }
+                }
+            }
+        }
+    }
+    $effectiveRatesJson = json_encode($effectiveRates, JSON_UNESCAPED_UNICODE);
+
     // Máximo de parcelas e faixa sem juros server-side quando é página de
     // fatura (consulta ciclo)
     $serverMax  = 0;
@@ -139,6 +147,28 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
             $serverMax = 0;
             $serverFree = 0;
         }
+
+        // Chave extra em EFFECTIVE_RATES para o ciclo REAL desta fatura
+        // (serverMax/serverFree, resolvidos acima) - pode não corresponder a
+        // nenhuma chave genérica de $cycleRules se a fatura tiver saldo/base
+        // que ajuste o teto. getRate() no JS usa esta chave quando
+        // SERVER_MAX > 0 (contexto de fatura), e uma chave de $cycleRules
+        // (carrinho, ainda sem fatura) caso contrário.
+        if ($serverMax > 0 && function_exists('pagarme_installmentTotal')) {
+            $effectiveRates['_invoice'] = array();
+            foreach (array('visa', 'mastercard', 'elo', 'amex', 'outras') as $b) {
+                $effectiveRates['_invoice'][$b] = array();
+                for ($n = 1; $n <= $serverMax; $n++) {
+                    try {
+                        $r = pagarme_installmentTotal($effectiveRateBase, $b, $n, $serverFree);
+                        $effectiveRates['_invoice'][$b][$n] = $r['rate'];
+                    } catch (\Throwable $e) {
+                        $effectiveRates['_invoice'][$b][$n] = 0;
+                    }
+                }
+            }
+            $effectiveRatesJson = json_encode($effectiveRates, JSON_UNESCAPED_UNICODE);
+        }
     }
 
     return <<<HTML
@@ -147,15 +177,15 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
     var GATEWAY_KEY = '{$gatewayKey}';
     var SERVER_MAX = {$serverMax};
     var SERVER_FREE = {$serverFree};
-    var FEES = {$feesJson};
     // Teto e faixa sem juros por ciclo, gerados pelo módulo PHP. Não editar
     // valores aqui: a fonte é pagarme_maxInstallmentsForMonths() /
     // pagarme_freeInstallmentsForMonths().
     var CYCLE_RULES = {$cycleRulesJson};
-    // Promoções "sem juros" ativas agora, por bandeira. Gerado por
-    // pagarme_isPromotionActive() no PHP - não reimplementar a janela de
-    // datas aqui.
-    var PROMOTIONS = {$promotionsJson};
+    // Percentual EFETIVO por ciclo/bandeira/parcela, já refletindo o modo de
+    // cálculo ativo (simples/composto, com/sem margem, promoção) e o teto de
+    // parcelas sem juros de cada ciclo - gerado por pagarme_installmentTotal()
+    // no PHP. Nunca reimplementar juros ou promoção aqui: o JS só multiplica.
+    var EFFECTIVE_RATES = {$effectiveRatesJson};
 
     function fmt(v){ return v.toFixed(2).replace('.', ','); }
     function parseMoney(t){
@@ -202,14 +232,15 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return 'outras';
     }
 
-    // Espelha pagarme_customerRate(): promoção ativa zera antes de qualquer
-    // outra coisa, senão só a taxa MDR, sem margem da loja. Qualquer
-    // divergência aqui faz o cliente ver um valor e ser cobrado outro.
-    function getRate(brand, n, free){
-        if(PROMOTIONS[brand]) return 0;
-        if(n<=free) return 0;
-        var bt=(FEES[brand]&&FEES[brand].credito)||(FEES.outras&&FEES.outras.credito)||{};
-        return parseFloat(bt[n])||0;
+    // Percentual efetivo (já com o modo de cálculo, promoção e faixa sem
+    // juros embutidos) para a bandeira/parcela, na tabela pré-calculada pelo
+    // PHP. cycleKey: '_invoice' quando há fatura resolvida no servidor
+    // (SERVER_MAX>0), senão a chave de ciclo do carrinho. Nunca calcular
+    // juros aqui - só ler o que o PHP já decidiu.
+    function getRate(cycleKey, brand, n){
+        var table = EFFECTIVE_RATES[cycleKey] || {};
+        var bt = table[brand] || table.outras || {};
+        return parseFloat(bt[n]) || 0;
     }
 
     function getTotal(){
@@ -279,11 +310,6 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return cycleRule('max', 1);
     }
 
-    function freeAllowed(){
-        if(SERVER_FREE>0) return SERVER_FREE;
-        return cycleRule('free', 1);
-    }
-
     function setInstallmentValue(v){
         v=String(parseInt(v,10)||1);
         try{ document.cookie='pagarme_installments='+v+'; path=/; max-age=900; SameSite=Lax'; }catch(e){}
@@ -305,8 +331,11 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         if(!isPagarmeSelected()){ removeIt(); return; }
         var total=getTotal();
         var maxInst=maxAllowed();
-        var free=freeAllowed();
         var brand=currentBrand();
+        // '_invoice': fatura já resolvida no servidor (ciclo real, via
+        // pagarme_maxInstallmentsForInvoice/freeInstallmentsForInvoice).
+        // Senão, carrinho ainda sem fatura: usa o ciclo lido do DOM.
+        var cycleKey = SERVER_MAX>0 ? '_invoice' : currentCycleValue();
 
         var sel=document.getElementById('pagarme_installments');
         if(!sel){
@@ -334,7 +363,7 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         var prev=sel.value;
         sel.innerHTML='';
         for(var n=1;n<=maxInst;n++){
-            var rate=getRate(brand,n,free);
+            var rate=getRate(cycleKey,brand,n);
             var perInst=(total>0)?(total*(1+rate/100)/n):0;
             var opt=document.createElement('option');
             opt.value=n;

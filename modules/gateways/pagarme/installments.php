@@ -492,6 +492,129 @@ function pagarme_feeForInstallments($baseAmount, $brand, $installments, $freeIns
 }
 
 /**
+ * Total de uma compra parcelada em N vezes a uma taxa mensal fixa, pela
+ * Tabela Price (Sistema Francês de Amortização): PMT = PV × [i(1+i)^n] /
+ * [(1+i)^n - 1], total = PMT × n.
+ *
+ * PURA: sem acesso a banco/localAPI. Trata a taxa recebida ($monthlyRatePercent)
+ * como uma taxa de juros MENSAL COMPOSTA — não como o percentual único que o
+ * modo simples usa. É o que o modo "Composta" da aba "Modo de Cálculo" pede:
+ * usar a própria taxa MDR cadastrada, mas compondo mês a mês em vez de
+ * aplicá-la uma única vez.
+ *
+ * @param float $baseAmount          PV (valor presente)
+ * @param float $monthlyRatePercent  Taxa mensal composta, em % (ex: 3.82)
+ * @param int   $installments        n (número de parcelas)
+ * @return float Total (PV + juros compostos), nunca abaixo do principal
+ */
+function pagarme_compoundTotal($baseAmount, $monthlyRatePercent, $installments)
+{
+    $baseAmount = (float) $baseAmount;
+    $installments = (int) $installments;
+
+    if ($installments <= 0 || $baseAmount <= 0) {
+        return $baseAmount;
+    }
+    if ($monthlyRatePercent <= 0) {
+        // Sem taxa, não há o que compor - equivalente ao modo simples com rate 0.
+        return $baseAmount;
+    }
+
+    $i = $monthlyRatePercent / 100;
+    $factor = pow(1 + $i, $installments);
+    if ($factor <= 1) {
+        // Guarda defensiva: (1+i)^n - 1 só é <= 0 se i <= 0, já descartado
+        // acima, mas evita divisão por zero em qualquer cenário de ponto
+        // flutuante inesperado.
+        return $baseAmount;
+    }
+
+    $pmt = $baseAmount * ($i * $factor) / ($factor - 1);
+    $total = round($pmt * $installments, 2);
+
+    return max($total, $baseAmount);
+}
+
+/**
+ * Carrega a configuração de modo de cálculo (fórmula simples/composta +
+ * margem fixa opcional), configurada pelo addon de admin
+ * (modules/addons/pagarme_fee_rates/). Nunca fatal: defaults seguros
+ * (simples, sem margem) se o arquivo não existir ou estiver corrompido -
+ * idêntico ao comportamento anterior a esta funcionalidade.
+ *
+ * @return array{formula: string, margin_enabled: bool, margin: array<string,float>}
+ */
+function pagarme_loadInstallmentMode()
+{
+    $config = pagarme_loadTable('pagarme_installment_mode.json');
+
+    $formula = (isset($config['formula']) && $config['formula'] === 'compound') ? 'compound' : 'simple';
+    $marginEnabled = !empty($config['margin_enabled']);
+    $margin = (isset($config['margin']) && is_array($config['margin'])) ? $config['margin'] : array();
+
+    return array(
+        'formula'        => $formula,
+        'margin_enabled' => $marginEnabled,
+        'margin'         => $margin,
+    );
+}
+
+/**
+ * Total autoritativo de uma opção de parcelamento: base + juros (simples ou
+ * compostos, conforme o modo) + margem fixa opcional (por cima do total já
+ * calculado, nunca somada à taxa MDR antes de compor - decisão de negócio).
+ *
+ * Substitui, nos 3 pontos que decidiam isso separadamente
+ * (pagarme_buildInstallmentOptions() 2x, pagarme_capture() 1x), o par
+ * pagarme_customerRate()+pagarme_feeForInstallments() por uma única chamada
+ * que já devolve total/rate/fee_amount prontos.
+ *
+ * $modeOverride permite à captura usar o modo PERSISTIDO no momento da
+ * escolha do cliente (ver mod_pagarme_installments), em vez de reler a
+ * configuração ao vivo - fecha a janela em que um admin muda o modo entre a
+ * escolha do cliente e a cobrança real, o que faria o exibido divergir do
+ * cobrado. Sem override (preview/exibição), lê a configuração ao vivo.
+ *
+ * @param float       $baseAmount
+ * @param string      $brand
+ * @param int         $installments
+ * @param int         $freeInstallments
+ * @param array|null  $modeOverride  {formula, margin_enabled, margin} ou null
+ * @return array{total: float, rate: float, fee_amount: float}
+ */
+function pagarme_installmentTotal($baseAmount, $brand, $installments, $freeInstallments, $modeOverride = null)
+{
+    $base = round((float) $baseAmount, 2);
+    $rate = pagarme_customerRate($brand, $installments, $freeInstallments);
+
+    if ($rate <= 0) {
+        $total = $base;
+    } else {
+        $mode = is_array($modeOverride) ? $modeOverride : pagarme_loadInstallmentMode();
+
+        if (isset($mode['formula']) && $mode['formula'] === 'compound') {
+            $total = pagarme_compoundTotal($base, $rate, $installments);
+        } else {
+            $total = round($base + pagarme_feeForInstallments($base, $brand, $installments, $freeInstallments), 2);
+        }
+
+        if (!empty($mode['margin_enabled']) && $installments > $freeInstallments) {
+            $marginTable = isset($mode['margin']) && is_array($mode['margin']) ? $mode['margin'] : array();
+            $marginPct = isset($marginTable[(string) $installments]) ? (float) $marginTable[(string) $installments] : 0.0;
+            if ($marginPct > 0) {
+                $total = round($total * (1 + $marginPct / 100), 2);
+            }
+        }
+    }
+
+    return array(
+        'total'      => $total,
+        'rate'       => $base > 0 ? round((($total - $base) / $base) * 100, 4) : 0.0,
+        'fee_amount' => round($total - $base, 2),
+    );
+}
+
+/**
  * Monta a lista de opções de parcelamento para um ciclo e uma base.
  *
  * PURA: não toca banco nem localAPI. É o núcleo testável do parcelamento e o
@@ -499,7 +622,10 @@ function pagarme_feeForInstallments($baseAmount, $brand, $installments, $freeIns
  *
  * 'total' é autoritativo (é o que será cobrado). 'installment_amount' é apenas
  * exibição - quem divide de fato a cobrança é a Pagar.me, que fica com eventual
- * diferença de centavo na última parcela.
+ * diferença de centavo na última parcela. 'rate' é o percentual EFETIVO total
+ * (fee_amount/base), não a taxa mensal nominal - em modo composto, a taxa
+ * mensal nominal (ex: 3,82%) some muito mais que isso ao longo de 12 parcelas,
+ * e mostrar o nominal ao cliente seria enganoso.
  *
  * @param int    $months     Meses do ciclo (ver pagarme_cycleToMonths)
  * @param float  $baseAmount Base de cálculo em reais
@@ -512,18 +638,18 @@ function pagarme_buildInstallmentOptions($months, $baseAmount, $brand)
     $free  = pagarme_freeInstallmentsForMonths($months);
     $brand = pagarme_normalizeBrand($brand);
     $base  = round((float) $baseAmount, 2);
+    $mode  = pagarme_loadInstallmentMode();
 
     $options = array();
     for ($n = 1; $n <= $max; $n++) {
-        $rate  = pagarme_customerRate($brand, $n, $free);
-        $fee   = pagarme_feeForInstallments($base, $brand, $n, $free);
-        $total = round($base + $fee, 2);
+        $result = pagarme_installmentTotal($base, $brand, $n, $free, $mode);
+        $total  = $result['total'];
 
         $options[] = array(
             'installments'       => $n,
-            'interest_free'      => ($rate <= 0),
-            'rate'               => round((float) $rate, 4),
-            'fee_amount'         => $fee,
+            'interest_free'      => ($result['fee_amount'] <= 0),
+            'rate'               => $result['rate'],
+            'fee_amount'         => $result['fee_amount'],
             'installment_amount' => round($total / $n, 2),
             'total'              => $total,
         );
@@ -650,8 +776,35 @@ function pagarme_ensureInstallmentsTable()
                 $table->integer('installments');
                 $table->decimal('base_amount', 12, 2);
                 $table->dateTime('expires_at');
+                $table->string('formula', 10)->default('simple');
+                $table->boolean('margin_enabled')->default(0);
+                $table->text('margin_snapshot')->nullable();
+            });
+            return $checked = true;
+        }
+
+        // Tabela já existe (instalação anterior a esta funcionalidade) -
+        // adiciona as colunas novas via migração idempotente, uma a uma.
+        // Seguro rodar em toda request: hasColumn() confere antes de alterar.
+        $newColumns = array('formula', 'margin_enabled', 'margin_snapshot');
+        $missing = array_filter($newColumns, function ($col) use ($schema) {
+            return !$schema->hasColumn('mod_pagarme_installments', $col);
+        });
+
+        if (!empty($missing)) {
+            $schema->table('mod_pagarme_installments', function ($table) use ($missing) {
+                if (in_array('formula', $missing, true)) {
+                    $table->string('formula', 10)->default('simple');
+                }
+                if (in_array('margin_enabled', $missing, true)) {
+                    $table->boolean('margin_enabled')->default(0);
+                }
+                if (in_array('margin_snapshot', $missing, true)) {
+                    $table->text('margin_snapshot')->nullable();
+                }
             });
         }
+
         return $checked = true;
     } catch (\Exception $e) {
         return $checked = false;
@@ -659,24 +812,41 @@ function pagarme_ensureInstallmentsTable()
 }
 
 /**
- * Grava a parcela escolhida para uma fatura.
+ * Grava a parcela escolhida para uma fatura, junto do modo de cálculo que
+ * estava ao vivo no momento da escolha (fórmula + margem, com um retrato da
+ * tabela de margem - não só a flag). Sem isso, se o admin trocar o modo ou
+ * editar a margem entre a escolha do cliente e a captura, o valor cobrado
+ * divergiria do que foi exibido - mesmo princípio que já protege base_amount.
  *
- * @param int   $invoiceId
- * @param int   $installments
- * @param float $baseAmount   Base usada no cálculo, para detectar fatura alterada
- * @param int   $ttlSeconds
+ * @param int    $invoiceId
+ * @param int    $installments
+ * @param float  $baseAmount      Base usada no cálculo, para detectar fatura alterada
+ * @param string $formula         'simple'|'compound', modo ao vivo no momento da escolha
+ * @param bool   $marginEnabled   Se a margem estava ativa no momento da escolha
+ * @param array  $marginSnapshot  Tabela de margem (parcela => %) no momento da escolha
+ * @param int    $ttlSeconds
  * @return bool
  */
-function pagarme_storeSelectedInstallments($invoiceId, $installments, $baseAmount, $ttlSeconds = 1800)
-{
+function pagarme_storeSelectedInstallments(
+    $invoiceId,
+    $installments,
+    $baseAmount,
+    $formula = 'simple',
+    $marginEnabled = false,
+    $marginSnapshot = array(),
+    $ttlSeconds = 1800
+) {
     if (!pagarme_ensureInstallmentsTable()) {
         return false;
     }
 
     $row = array(
-        'installments' => (int) $installments,
-        'base_amount'  => number_format((float) $baseAmount, 2, '.', ''),
-        'expires_at'   => date('Y-m-d H:i:s', time() + (int) $ttlSeconds),
+        'installments'    => (int) $installments,
+        'base_amount'     => number_format((float) $baseAmount, 2, '.', ''),
+        'expires_at'      => date('Y-m-d H:i:s', time() + (int) $ttlSeconds),
+        'formula'         => ($formula === 'compound') ? 'compound' : 'simple',
+        'margin_enabled'  => $marginEnabled ? 1 : 0,
+        'margin_snapshot' => !empty($marginSnapshot) ? json_encode($marginSnapshot) : null,
     );
 
     try {
@@ -701,12 +871,23 @@ function pagarme_storeSelectedInstallments($invoiceId, $installments, $baseAmoun
  * significaria cobrar o cliente num plano diferente do que ele viu e aceitou.
  * Por isso o retorno traz sempre um 'status'.
  *
+ * Também devolve o modo de cálculo persistido (formula/margin_enabled/margin),
+ * para pagarme_capture() usar como $modeOverride em pagarme_installmentTotal()
+ * em vez de reler a configuração ao vivo - garante que a cobrança usa
+ * exatamente o modo que estava ativo quando o cliente viu o preço.
+ *
  * @param int $invoiceId
  * @return array status: none|valid|expired|base_changed|unavailable
  */
 function pagarme_readStoredInstallments($invoiceId)
 {
-    $empty = array('installments' => null, 'base_amount' => null);
+    $empty = array(
+        'installments'   => null,
+        'base_amount'    => null,
+        'formula'        => 'simple',
+        'margin_enabled' => false,
+        'margin'         => array(),
+    );
 
     if (!pagarme_ensureInstallmentsTable()) {
         return array_merge($empty, array('status' => 'unavailable'));
@@ -724,9 +905,20 @@ function pagarme_readStoredInstallments($invoiceId)
         return array_merge($empty, array('status' => 'none'));
     }
 
+    $marginSnapshot = array();
+    if (!empty($row->margin_snapshot)) {
+        $decoded = json_decode($row->margin_snapshot, true);
+        if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+            $marginSnapshot = $decoded;
+        }
+    }
+
     $found = array(
-        'installments' => (int) $row->installments,
-        'base_amount'  => (float) $row->base_amount,
+        'installments'   => (int) $row->installments,
+        'base_amount'    => (float) $row->base_amount,
+        'formula'        => (isset($row->formula) && $row->formula === 'compound') ? 'compound' : 'simple',
+        'margin_enabled' => !empty($row->margin_enabled),
+        'margin'         => $marginSnapshot,
     );
 
     if (strtotime($row->expires_at) < time()) {

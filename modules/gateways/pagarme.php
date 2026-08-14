@@ -188,12 +188,29 @@ function pagarme_capture($params)
     // Base de cálculo: o que o cliente deve SEM o juros de uma tentativa
     // anterior. Usar $params['amount'] aqui faria o juros incidir sobre o juros
     // já lançado na fatura a cada retentativa.
-    $baseAmount   = pagarme_invoiceBaseAmount($params['invoiceid']);
-    $customerRate = pagarme_customerRate($brand, $installments, $freeInstallments);
+    $baseAmount = pagarme_invoiceBaseAmount($params['invoiceid']);
+
+    // Modo de cálculo (simples/composto + margem): usa o que estava
+    // PERSISTIDO no momento em que o cliente viu o preço (via
+    // pagarme_readStoredInstallments() acima), não a configuração ao vivo do
+    // admin. Sem isso, um admin trocando o modo entre a escolha do cliente e
+    // esta captura cobraria um valor diferente do que foi exibido - mesmo
+    // risco que expected_total já protege para o total em si.
+    $modeOverride = null;
+    if (isset($stored) && isset($stored['status']) && $stored['status'] === 'valid') {
+        $modeOverride = array(
+            'formula'        => $stored['formula'],
+            'margin_enabled' => $stored['margin_enabled'],
+            'margin'         => $stored['margin'],
+        );
+    }
+
+    $installmentResult = pagarme_installmentTotal($baseAmount, $brand, $installments, $freeInstallments, $modeOverride);
+    $customerRate = $installmentResult['rate'];
     $chargeAmount = $params['amount'];
 
-    if ($customerRate > 0) {
-        $feeAmount = pagarme_feeForInstallments($baseAmount, $brand, $installments, $freeInstallments);
+    if ($installmentResult['fee_amount'] > 0) {
+        $feeAmount = $installmentResult['fee_amount'];
 
         // Reconciliação: adiciona o juros como item na fatura, para que o
         // total cobrado seja igual ao total da fatura no WHMCS.
@@ -344,10 +361,17 @@ function pagarme_capture($params)
 
             // Taxa de transação (MDR real, tabela cheia à vista/2-6x/7-12x -
             // ver pagarme_transactionFeeAmount) sobre o valor bruto realmente
-            // processado. É sobre esse total que a Pagar.me também desconta o
-            // MDR, então rateamos entre as duas parcelas do pagamento (base +
-            // juros de parcelamento, se houver) na mesma proporção, para que a
-            // soma das duas bata com o valor real.
+            // processado, usando a taxa REAL da FAIXA de parcelas escolhida
+            // (ex: 12x usa a taxa real de 7-12x) - não fixa em 1x. Campo
+            // interno do WHMCS (tblaccounts.fees), nunca cobrado do cliente,
+            // mas reflete o custo MDR real que a Pagar.me cobra da loja para
+            // aquela faixa de parcelas. Revertido em 14/08/2026 de "sempre
+            // 1x" (decisão anterior no mesmo dia) de volta para a taxa da
+            // faixa real, por decisão de negócio. É sobre esse total que a
+            // Pagar.me também desconta o MDR, então rateamos entre as duas
+            // parcelas do pagamento (base + juros de parcelamento, se houver)
+            // na mesma proporção, para que a soma das duas bata com o valor
+            // real.
             $transactionFee     = pagarme_transactionFeeAmount($chargeAmount, $brand, $installments);
             $baseTransactionFee = $transactionFee;
             $interestFee        = 0.0;

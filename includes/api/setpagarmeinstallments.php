@@ -115,7 +115,25 @@ try {
         return;
     }
 
-    if (!pagarme_storeSelectedInstallments($invoiceId, $installments, $data['base_amount'])) {
+    // Snapshot do modo de cálculo AO VIVO neste exato momento (o mesmo que
+    // pagarme_installmentOptionsForInvoice() acabou de usar para calcular
+    // $chosen['total'], validado acima contra expected_total). Persistido
+    // junto da escolha para a captura usar o MESMO modo, não o que estiver
+    // ativo depois - ver pagarme_installmentTotal()/pagarme_capture().
+    $modeSnapshot = function_exists('pagarme_loadInstallmentMode')
+        ? pagarme_loadInstallmentMode()
+        : array('formula' => 'simple', 'margin_enabled' => false, 'margin' => array());
+
+    $stored = pagarme_storeSelectedInstallments(
+        $invoiceId,
+        $installments,
+        $data['base_amount'],
+        $modeSnapshot['formula'],
+        $modeSnapshot['margin_enabled'],
+        $modeSnapshot['margin']
+    );
+
+    if (!$stored) {
         $apiresults = array(
             'result'  => 'error',
             'message' => 'Não foi possível registrar o parcelamento.',

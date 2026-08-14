@@ -23,10 +23,41 @@ Implementado em `pagarme_maxInstallmentsForMonths` (teto) e
 O juros é a **taxa MDR da Pagar.me**, repassada ao comprador e adicionada como
 item na fatura, para que o total cobrado bata com a contabilidade do WHMCS.
 
-**Sem margem da loja.** A margem de `stay_margins.json` existia para cobrir o
-custo de antecipar recebíveis; como a Stay não antecipa (recebe parcela a
-parcela), o custo real do parcelamento é o próprio MDR. O arquivo permanece no
-repositório como histórico e **não é mais lido**.
+### Modo de cálculo (14/08/2026): simples (padrão) ou composto + margem opcional
+
+Por padrão o juros é **simples**: a taxa MDR é aplicada uma única vez sobre a
+base, independente do número de parcelas dentro da mesma faixa (ex: 7x e 12x
+usam a mesma taxa "7-12x"). Esse continua sendo o comportamento sem nenhuma
+configuração adicional.
+
+Configurável pelo addon `modules/addons/pagarme_fee_rates/` (aba "Modo de
+Cálculo"):
+
+- **Composto** — Tabela Price/Sistema Francês de Amortização
+  (`pagarme_compoundTotal()`), usando a taxa MDR cadastrada como taxa mensal
+  composta. Resulta num total maior que o modo simples para a mesma taxa
+  nominal, crescendo mais que proporcionalmente com o número de parcelas.
+- **Margem fixa opcional** (desligada por padrão) — reintroduz o mecanismo do
+  antigo `stay_margins.json` como um toggle configurável, aplicado **por cima**
+  do total já calculado (simples ou composto), nunca somado à taxa MDR antes
+  do cálculo.
+
+Função central: `pagarme_installmentTotal($baseAmount, $brand, $installments,
+$freeInstallments, $modeOverride)` em `installments.php`, que substitui as
+chamadas separadas a `pagarme_customerRate()`/`pagarme_feeForInstallments()`
+nos 3 pontos que decidem o total (`pagarme_buildInstallmentOptions()` 2x,
+`pagarme_capture()` 1x) e no hook `pagarme_installments_selector.php`
+(client-area, via `EFFECTIVE_RATES` pré-calculado no PHP).
+
+**O modo é persistido junto da escolha do cliente** (`mod_pagarme_installments`,
+colunas `formula`/`margin_enabled`/`margin_snapshot`), não relido ao vivo na
+captura. Isso fecha a janela em que um admin muda o modo entre o cliente ver o
+preço e a cobrança de fato acontecer — a captura sempre usa o modo que estava
+ativo no momento em que o cliente viu o total, nunca o modo atual.
+
+**A margem antiga (`stay_margins.json`) segue sem uso** — o arquivo novo
+(`pagarme_installment_mode.json`) tem formato equivalente mas é um mecanismo
+separado, editável pelo addon, desligado por padrão.
 
 ### Base de cálculo
 
@@ -47,11 +78,18 @@ fatura ficaria permanentemente inflada.
   bandeira e número de parcelas. Conferido contra a proposta comercial.
 - `modules/gateways/pagarme/inc/stay_margins.json` — **não utilizado**; mantido
   só como histórico
+- `modules/gateways/pagarme/inc/pagarme_installment_mode.json` — modo de
+  cálculo ativo (fórmula simples/composta + margem fixa opcional), gravado
+  pelo addon `pagarme_fee_rates`
 - `includes/api/` — custom API actions `GetPagarmeInstallments` e
   `SetPagarmeInstallments`, que expõem o parcelamento para os checkouts
   headless. Ver `includes/api/README.md` (instalação e registro).
 - `includes/hooks/pagarme_installments_selector.php` — seletor na área do
-  cliente do WHMCS. **Não executa** nos checkouts headless.
+  cliente do WHMCS. **Não executa** nos checkouts headless. Usa
+  `EFFECTIVE_RATES` pré-calculado no PHP (via `pagarme_installmentTotal()`),
+  nunca reimplementa juros/promoção em JavaScript.
+- `modules/addons/pagarme_fee_rates/` — addon de admin (taxas, promoções,
+  modo de cálculo). Ver seção 8 do `README.md`.
 
 ## Taxas — conferidas (03/08/2026)
 
@@ -82,14 +120,29 @@ início do projeto e estava errado; foi corrigido.
 > 3,82% desta tabela. Em conta de teste a Pagar.me costuma aplicar a tabela
 > padrão dela, não a negociada — em investigação se produção bate com a
 > proposta comercial antes de mudar estes números.
+>
+> **Fica mais crítico com o modo composto (14/08/2026):** juros compostos
+> amplificam superlinearmente qualquer erro na taxa base ao longo de N
+> parcelas — o mesmo desvio de ~0,7pp que muda pouco no modo simples muda bem
+> mais em 12x composto. **Não ativar o modo composto em produção antes desta
+> investigação de taxa ser encerrada**, mesmo que o addon já permita.
 
 ### Taxa de transação (MDR real) — campo nativo do WHMCS, não cobrada do cliente
 
 Distinta do juros de parcelamento acima. O juros é repassado ao cliente **só**
-fora da faixa sem juros do ciclo; a taxa de transação é o custo real que a
-Pagar.me cobra da loja em **qualquer** cobrança de cartão (inclusive 1x à vista
-e dentro da faixa sem juros), usando a tabela cheia (à vista / 2-6x / 7-12x —
-`pagarme_transactionFeeAmount()` em `installments.php`).
+fora da faixa sem juros do ciclo; a taxa de transação é o custo interno
+registrado no WHMCS, sem relação com o juros repassado ao cliente.
+
+Usa a taxa MDR **real da faixa de parcelas escolhida** pelo cliente (ex: 12x usa a
+taxa real de 7-12x, não a de 1x) — `pagarme_transactionFeeAmount($chargeAmount,
+$brand, $installments)`, tabela cheia à vista/2-6x/7-12x. Aplicada sobre o valor
+bruto realmente processado (`$chargeAmount`).
+
+> **Histórico:** entre a manhã e a tarde de 14/08/2026 esta regra foi
+> temporariamente trocada para "sempre a taxa 1x/à vista, independente da
+> parcela", e depois revertida no mesmo dia de volta para a taxa da faixa real
+> — decisão de negócio confirmada nas duas direções pelo usuário. A regra
+> vigente é a taxa da faixa real.
 
 Vai para o campo **nativo** de taxa de transação do WHMCS: `_capture()` retorna
 a chave `'fee'` (contrato documentado da WHMCS para módulos de gateway), que o
@@ -157,15 +210,34 @@ API (ver `includes/api/README.md`):
     cobrança
 11. Após qualquer captura aprovada (inclusive 1x à vista) → a coluna "Taxas da
     Transação" da fatura (aba Resumo, tabela Transações) mostra o valor real da
-    MDR na linha da cobrança, e `tblinvoices.total` **não muda**.
+    MDR **na taxa da faixa de parcelas escolhida** (ex: 3,82% em 12x, não a taxa
+    de 1x), e `tblinvoices.total` **não muda**.
 12. Fatura anual, 8x (com juros) → a taxa de transação aparece rateada entre as
     DUAS linhas de transação (a base e a `_fee` do juros); a soma das duas bate
-    com `pagarme_transactionFeeAmount()` sobre o valor bruto total.
+    com `pagarme_transactionFeeAmount($chargeAmount, $brand, 8)` sobre o valor
+    bruto total (taxa real de 8x, não a taxa de 1x).
 
 > Ponto que merece atenção especial no teste: a reconciliação da fatura quando
 > há juros (itens 2 e 3). O módulo aplica a parcela do juros e o WHMCS aplica o
 > restante; confirme que a fatura fecha exatamente em zero, sem saldo residual
 > nem pagamento duplicado.
+
+Modo de cálculo (14/08/2026, addon `pagarme_fee_rates`, aba "Modo de Cálculo"):
+
+13. Modo simples (default) + margem desligada → nenhuma mudança de comportamento
+    em relação aos itens 1-12 acima.
+14. Ativar modo composto → fatura anual 12x calcula um total MAIOR que o modo
+    simples equivalente para a mesma taxa nominal (juros compostos > juros
+    simples para n>1); conferir a fórmula manualmente para uma parcela.
+15. Ativar margem fixa junto do composto → total final = (total composto) ×
+    (1 + margem%); nunca margem somada à taxa MDR antes de compor.
+16. Escolher parcela com um modo ativo (`SetPagarmeInstallments`) → admin muda
+    o modo → capturar a fatura → a cobrança real usa o modo que estava ativo
+    NO MOMENTO DA ESCOLHA (persistido em `mod_pagarme_installments`), não o
+    modo atual do admin.
+17. Com o hook `pagarme_installments_selector.php` instalado → o seletor no
+    client area mostra o mesmo total que `GetPagarmeInstallments` calcularia
+    para a mesma fatura, em qualquer modo (simples ou composto).
 
 ## Problema em aberto: cartão salvo no pedido novo (Lagom Smart Order Form)
 

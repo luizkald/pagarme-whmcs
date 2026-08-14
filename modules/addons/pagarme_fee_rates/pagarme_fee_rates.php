@@ -146,6 +146,17 @@ function pagarme_fee_rates_promotionsPath()
 }
 
 /**
+ * Caminho do arquivo de modo de cálculo (fórmula simples/composta + margem).
+ *
+ * @return string
+ */
+function pagarme_fee_rates_modePath()
+{
+    return dirname(dirname(__DIR__))
+        . '/gateways/pagarme/inc/pagarme_installment_mode.json';
+}
+
+/**
  * Garante que o piso de taxas existe, criando-o a partir do arquivo de
  * taxas ATUAL na primeira vez que esta função roda (nunca depois disso —
  * uma vez criado, o piso só é alterado manualmente por um dev editando o
@@ -518,6 +529,372 @@ function pagarme_fee_rates_logPromotionChange($before, $after)
 }
 
 /**
+ * Valida o POST do modo de cálculo (fórmula simples/composta + margem fixa
+ * opcional) e monta o array pronto para serialização.
+ *
+ * Diferente da grade de taxas: a margem NÃO tem piso/mínimo (é markup
+ * discricionário da loja, sem custo real de gateway a proteger) - só a faixa
+ * 0-20 já usada na grade principal.
+ *
+ * @param mixed $postedMode $_POST['mode'] bruto
+ * @return array{success: bool, data: array|null, errors: string[]}
+ */
+function pagarme_fee_rates_validateMode($postedMode)
+{
+    $errors = array();
+
+    if (!is_array($postedMode)) {
+        $postedMode = array();
+    }
+
+    $formula = (isset($postedMode['formula']) && $postedMode['formula'] === 'compound') ? 'compound' : 'simple';
+    $marginEnabled = !empty($postedMode['margin_enabled']);
+
+    $margin = array();
+    $postedMargin = isset($postedMode['margin']) && is_array($postedMode['margin']) ? $postedMode['margin'] : array();
+
+    for ($n = 1; $n <= 12; $n++) {
+        $key = (string) $n;
+        $raw = array_key_exists($key, $postedMargin) ? trim((string) $postedMargin[$key]) : '0';
+
+        if ($raw === '' || !is_numeric($raw)) {
+            $errors[] = "Valor inválido em Margem fixa {$n}x: informe um número.";
+            continue;
+        }
+
+        $value = (float) $raw;
+        if ($value < 0 || $value > 20) {
+            $errors[] = "Valor fora da faixa em Margem fixa {$n}x: deve estar entre 0 e 20.";
+            continue;
+        }
+
+        $margin[$key] = round($value, 2);
+    }
+
+    if (!empty($errors)) {
+        return array('success' => false, 'data' => null, 'errors' => $errors);
+    }
+
+    return array(
+        'success' => true,
+        'data'    => array(
+            'formula'        => $formula,
+            'margin_enabled' => $marginEnabled,
+            'margin'         => $margin,
+        ),
+        'errors' => array(),
+    );
+}
+
+/**
+ * Registra no Activity Log a mudança de modo de cálculo (fórmula e/ou
+ * margem) - separado dos outros dois logs para não misturar tipos de
+ * mudança na mesma entrada.
+ *
+ * @param array $before
+ * @param array $after
+ */
+function pagarme_fee_rates_logModeChange($before, $after)
+{
+    if (!function_exists('logActivity')) {
+        return;
+    }
+
+    try {
+        $changes = array();
+
+        $oldFormula = isset($before['formula']) && $before['formula'] === 'compound' ? 'compound' : 'simple';
+        $newFormula = isset($after['formula']) && $after['formula'] === 'compound' ? 'compound' : 'simple';
+        if ($oldFormula !== $newFormula) {
+            $label = array('simple' => 'Simples', 'compound' => 'Composta (Tabela Price)');
+            $changes[] = "Fórmula: {$label[$oldFormula]} -> {$label[$newFormula]}";
+        }
+
+        $oldMarginEnabled = !empty($before['margin_enabled']);
+        $newMarginEnabled = !empty($after['margin_enabled']);
+        if ($oldMarginEnabled !== $newMarginEnabled) {
+            $changes[] = 'Margem fixa: ' . ($newMarginEnabled ? 'ativada' : 'desativada');
+        }
+
+        $oldMargin = isset($before['margin']) && is_array($before['margin']) ? $before['margin'] : array();
+        $newMargin = isset($after['margin']) && is_array($after['margin']) ? $after['margin'] : array();
+        for ($n = 1; $n <= 12; $n++) {
+            $key = (string) $n;
+            $old = round((float) (isset($oldMargin[$key]) ? $oldMargin[$key] : 0), 2);
+            $new = round((float) (isset($newMargin[$key]) ? $newMargin[$key] : 0), 2);
+            if ($old !== $new) {
+                $changes[] = "Margem {$n}x: {$old}% -> {$new}%";
+            }
+        }
+
+        if (empty($changes)) {
+            return;
+        }
+
+        $adminId = isset($_SESSION['adminid']) ? (int) $_SESSION['adminid'] : 0;
+        $description = 'Pagar.me - Modo de cálculo alterado: ' . implode('; ', $changes);
+        logActivity(substr($description, 0, 2000), $adminId);
+    } catch (\Throwable $e) {
+        // Log nunca pode derrubar um save que já teve sucesso.
+    }
+}
+
+/**
+ * Ciclos conhecidos (rótulo => meses), mesmos usados em
+ * includes/hooks/pagarme_installments_selector.php (CYCLE_LABELS) - mantidos
+ * em sincronia manualmente, mesmo padrão de duplicação fina já usado em todo
+ * este arquivo (isolamento deliberado, ver cabeçalho do arquivo).
+ *
+ * @return array<string, array{label: string, months: int}>
+ */
+function pagarme_fee_rates_cycles()
+{
+    return array(
+        'monthly'      => array('label' => 'Mensal', 'months' => 1),
+        'quarterly'    => array('label' => 'Trimestral', 'months' => 3),
+        'semiannually' => array('label' => 'Semestral', 'months' => 6),
+        'annually'     => array('label' => 'Anual', 'months' => 12),
+        'biennially'   => array('label' => 'Bienal', 'months' => 24),
+        'triennially'  => array('label' => 'Trienal', 'months' => 36),
+    );
+}
+
+/**
+ * Teto de parcelas para um ciclo (em meses). Espelha
+ * pagarme_maxInstallmentsForMonths() em modules/gateways/pagarme/installments.php
+ * - replicado aqui por ser uma tabela fixa pequena, mantendo o isolamento do
+ * addon (ver cabeçalho do arquivo). Mudar as regras de negócio exige
+ * atualizar as duas funções.
+ *
+ * @param int $months
+ * @return int
+ */
+function pagarme_fee_rates_maxInstallmentsForMonths($months)
+{
+    if ($months <= 1) {
+        return 1;
+    }
+    if ($months <= 3) {
+        return 3;
+    }
+    if ($months <= 6) {
+        return 6;
+    }
+    return 12;
+}
+
+/**
+ * Parcelas sem juros para um ciclo (em meses). Espelha
+ * pagarme_freeInstallmentsForMonths() em modules/gateways/pagarme/installments.php
+ * - mesma nota de replicação acima.
+ *
+ * @param int $months
+ * @return int
+ */
+function pagarme_fee_rates_freeInstallmentsForMonths($months)
+{
+    if ($months <= 1) {
+        return 1;
+    }
+    if ($months <= 3) {
+        return 1;
+    }
+    if ($months <= 6) {
+        return 3;
+    }
+    if ($months <= 24) {
+        return 5;
+    }
+    return 6;
+}
+
+/**
+ * Converte um valor monetário digitado em BR (1.389,96 ou 1389,96) ou em US
+ * (1389.96) para float. Aceita os dois formatos porque o campo é texto livre
+ * e a maior parte de quem usa esta tela vai digitar no formato BR (vírgula
+ * decimal) - is_numeric() sozinho rejeita vírgula, o que fazia todo valor
+ * digitado nesse formato falhar a validação.
+ *
+ * Regra: se o valor tem vírgula E ponto, o ÚLTIMO separador (o mais à
+ * direita) é o decimal, e o outro é separador de milhar, removido antes de
+ * converter - cobre "1.389,96" (BR) e, por simetria, "1,389.96" (US) sem
+ * precisar de um campo de formato separado. Se só tem vírgula, ela é o
+ * decimal. Se só tem ponto, ele é o decimal (comportamento nativo do PHP).
+ *
+ * @param mixed $raw
+ * @return float|null null se não for um número válido em nenhum dos formatos
+ */
+function pagarme_fee_rates_parseAmount($raw)
+{
+    $value = trim((string) $raw);
+    if ($value === '') {
+        return null;
+    }
+
+    $hasComma = strpos($value, ',') !== false;
+    $hasDot = strpos($value, '.') !== false;
+
+    if ($hasComma && $hasDot) {
+        $lastComma = strrpos($value, ',');
+        $lastDot = strrpos($value, '.');
+        if ($lastComma > $lastDot) {
+            // "1.389,96" - ponto é milhar, vírgula é decimal.
+            $value = str_replace('.', '', $value);
+            $value = str_replace(',', '.', $value);
+        } else {
+            // "1,389.96" - vírgula é milhar, ponto é decimal.
+            $value = str_replace(',', '', $value);
+        }
+    } elseif ($hasComma) {
+        $value = str_replace(',', '.', $value);
+    }
+    // Só ponto, ou nenhum separador: já está no formato que is_numeric() aceita.
+
+    return is_numeric($value) ? (float) $value : null;
+}
+
+/**
+ * Simula o parcelamento para um valor/bandeira/ciclo/modo, SEM tocar em
+ * nenhum arquivo em disco - nunca grava, nunca loga, nunca afeta o modo de
+ * cálculo salvo (aba "Modo de Cálculo"). Usa as taxas MDR REAIS já gravadas
+ * (via $taxesTable, já carregada pelo output() - não relê o arquivo aqui),
+ * para a simulação refletir fielmente o que uma cobrança real faria.
+ *
+ * A matemática de juros (simples/composta/margem) é replicada aqui a partir
+ * de pagarme_compoundTotal()/pagarme_installmentTotal()
+ * (modules/gateways/pagarme/installments.php) - deliberado, não um lapso: ao
+ * contrário dos outros lugares desta sessão que duplicavam cálculo (onde
+ * divergir significa cobrar errado), esta simulação nunca cobra ninguém e
+ * nunca é lida por nenhum outro código. O pior caso de uma divergência
+ * futura é a calculadora mostrar um número errado numa tela só de consulta,
+ * nunca uma cobrança incorreta - por isso o isolamento do addon (sem
+ * `require` do módulo de gateway) prevalece aqui também.
+ *
+ * O "resumo" de cada linha (valor inicial / valor adicional de parcelamento /
+ * taxa de serviço do gateway) mostra: base da fatura; o juros repassado ao
+ * CLIENTE (0 dentro da faixa sem juros); e o custo MDR REAL que a Pagar.me
+ * cobra da loja pela FAIXA de parcelas escolhida (ex: 12x usa a taxa real de
+ * 7-12x, não a de 1x), sobre o total. Esta terceira coluna é
+ * DELIBERADAMENTE DIFERENTE do campo interno real do WHMCS
+ * (pagarme_transactionFeeAmount(), que desde 14/08/2026 sempre usa a taxa
+ * 1x/à vista por decisão de negócio) - aqui o objetivo é mostrar o custo
+ * real da Pagar.me para aquela faixa específica, útil para decidir se vale
+ * repassar mais ou menos juros, não replicar o que fica escriturado no
+ * WHMCS.
+ *
+ * @param mixed  $amount        Valor a simular, texto livre (BR ou US) - ver pagarme_fee_rates_parseAmount()
+ * @param string $brand         Bandeira (uma das PAGARME_FEE_RATES_BRANDS)
+ * @param string $cycleKey      Chave de pagarme_fee_rates_cycles()
+ * @param string $formula       'simple'|'compound'
+ * @param bool   $marginEnabled
+ * @param array  $marginTable   parcela => %
+ * @param array  $taxesTable    Tabela de taxas MDR já carregada (pagarme_credit_card_taxes.json)
+ * @return array{success: bool, errors: string[], rows: array, cycleLabel: string, maxInstallments: int, freeInstallments: int}
+ */
+function pagarme_fee_rates_simulate($amount, $brand, $cycleKey, $formula, $marginEnabled, $marginTable, $taxesTable)
+{
+    $errors = array();
+
+    $amount = pagarme_fee_rates_parseAmount($amount);
+    if ($amount === null || $amount <= 0) {
+        $errors[] = 'Informe um valor maior que zero para simular (aceita vírgula ou ponto decimal).';
+        $amount = 0.0;
+    }
+
+    $cycles = pagarme_fee_rates_cycles();
+    if (!isset($cycles[$cycleKey])) {
+        $errors[] = 'Ciclo inválido.';
+    }
+
+    if (!in_array($brand, PAGARME_FEE_RATES_BRANDS, true)) {
+        $brand = 'outras';
+    }
+
+    if (!empty($errors)) {
+        return array(
+            'success'          => false,
+            'errors'           => $errors,
+            'rows'             => array(),
+            'cycleLabel'       => '',
+            'maxInstallments'  => 0,
+            'freeInstallments' => 0,
+        );
+    }
+
+    $months = $cycles[$cycleKey]['months'];
+    $max = pagarme_fee_rates_maxInstallmentsForMonths($months);
+    $free = pagarme_fee_rates_freeInstallmentsForMonths($months);
+
+    $feeTable = isset($taxesTable[$brand]['credito']) ? $taxesTable[$brand]['credito'] : array();
+    if (empty($feeTable) && isset($taxesTable['outras']['credito'])) {
+        $feeTable = $taxesTable['outras']['credito'];
+    }
+
+    $rows = array();
+    for ($n = 1; $n <= $max; $n++) {
+        // Taxa REAL da faixa desta parcela (MDR que a Pagar.me cobra da loja),
+        // sem zerar pela faixa sem juros - distinta do juros repassado ao
+        // CLIENTE, que é 0 dentro da faixa livre. Mesma distinção que
+        // pagarme_mdrRate() (custo real, sempre) faz com
+        // pagarme_customerRate() (juros do cliente, zera na faixa livre) no
+        // módulo de gateway.
+        $realMdrRate = isset($feeTable[(string) $n]) ? (float) $feeTable[(string) $n] : 0.0;
+        $customerRate = ($n <= $free) ? 0.0 : $realMdrRate;
+
+        if ($customerRate <= 0) {
+            $total = $amount;
+        } elseif ($formula === 'compound') {
+            // Mesma fórmula de pagarme_compoundTotal() (Tabela Price), replicada
+            // aqui deliberadamente - ver nota de isolamento no docblock acima.
+            $i = $customerRate / 100;
+            $factor = pow(1 + $i, $n);
+            $total = ($factor > 1) ? round($amount * ($i * $factor) / ($factor - 1) * $n, 2) : $amount;
+            $total = max($total, $amount);
+        } else {
+            $total = round($amount + $amount * ($customerRate / 100), 2);
+        }
+
+        if ($marginEnabled && $n > $free) {
+            $marginPct = isset($marginTable[(string) $n]) ? (float) $marginTable[(string) $n] : 0.0;
+            if ($marginPct > 0) {
+                $total = round($total * (1 + $marginPct / 100), 2);
+            }
+        }
+
+        $effectiveRate = $amount > 0 ? round((($total - $amount) / $amount) * 100, 4) : 0.0;
+        $installmentFee = round($total - $amount, 2);
+        // Taxa de serviço do gateway, na simulação: a taxa MDR REAL da faixa
+        // escolhida (não fixa em 1x) sobre o total - decisão confirmada com o
+        // usuário em 14/08/2026, distinta da regra do campo interno REAL do
+        // WHMCS (pagarme_transactionFeeAmount(), sempre 1x, ver Fase 16) - a
+        // simulação mostra o custo real da Pagar.me para AQUELA faixa de
+        // parcelas, não o que acaba escriturado no WHMCS por decisão de
+        // negócio separada.
+        $gatewayServiceFee = round($total * ($realMdrRate / 100), 2);
+
+        $rows[] = array(
+            'installments'       => $n,
+            'rate'               => $effectiveRate,
+            'interest_free'      => ($total <= $amount + 0.001),
+            'installment_amount' => round($total / $n, 2),
+            'total'              => $total,
+            'initial_amount'     => $amount,
+            'installment_fee'    => $installmentFee,
+            'gateway_service_fee' => $gatewayServiceFee,
+        );
+    }
+
+    return array(
+        'success'          => true,
+        'errors'           => array(),
+        'rows'             => $rows,
+        'cycleLabel'       => $cycles[$cycleKey]['label'],
+        'maxInstallments'  => $max,
+        'freeInstallments' => $free,
+    );
+}
+
+/**
  * Rótulo de exibição de uma bandeira (para mensagens de erro/log legíveis).
  *
  * @param string $brand
@@ -541,22 +918,33 @@ function pagarme_fee_rates_h($value)
 }
 
 /**
- * Renderiza a página (formulário + avisos). $values é a grade
- * bandeira => parcela => valor (crua, pode conter o que o usuário acabou de
- * digitar em caso de erro de validação). $floorGrid é o piso, mesma forma,
- * só leitura (nunca editável pela tela). $promotions é
- * bandeira => {active, start, end}.
+ * Renderiza a página (4 abas: Taxas, Promoção sem juros, Modo de Cálculo,
+ * Simulador + avisos). $values é a grade bandeira => parcela => valor (crua,
+ * pode conter o que o usuário acabou de digitar em caso de erro de
+ * validação). $floorGrid é o piso, mesma forma, só leitura (nunca editável
+ * pela tela). $promotions é bandeira => {active, start, end}. $mode é
+ * {formula, margin_enabled, margin}. $simInput são os campos da simulação tal
+ * como enviados (para reexibir o formulário preenchido); $simResult é o
+ * retorno de pagarme_fee_rates_simulate() ou null se ainda não simulou.
  *
  * @param array $values
  * @param array $floorGrid
  * @param array $promotions
+ * @param array $mode
+ * @param array $simInput
+ * @param array|null $simResult
  * @param string[] $errors
  * @param bool $justSaved
  * @param string $moduleLink
+ * @param string $activeTab 'taxas'|'promo'|'modo'|'sim' - qual aba deve abrir já selecionada
  * @return string
  */
-function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors, $justSaved, $moduleLink)
+function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $simInput, $simResult, $errors, $justSaved, $moduleLink, $activeTab = 'taxas')
 {
+    $knownTabs = array('taxas', 'promo', 'modo', 'sim');
+    if (!in_array($activeTab, $knownTabs, true)) {
+        $activeTab = 'taxas';
+    }
     $groups = array(
         1  => 'g1',
         2  => 'g2', 3 => 'g2', 4 => 'g2', 5 => 'g2', 6 => 'g2',
@@ -633,6 +1021,63 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
         .pfr-promo-dates-cols > div { flex: 1 1 260px; min-width: 220px; }
         .pfr-promo-dates-cols ul { margin: 4px 0 0; padding-left: 18px; }
         .pfr-promo-dates-cols li { margin-bottom: 2px; }
+        .pfr-tabs { display: flex; gap: 4px; border-bottom: 2px solid #ddd; margin-top: 14px; }
+        .pfr-tab-btn {
+            padding: 8px 16px;
+            border: 1px solid #ddd;
+            border-bottom: none;
+            border-radius: 4px 4px 0 0;
+            background: #f5f5f5;
+            color: #555;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        .pfr-tab-btn.pfr-tab-active { background: #fff; color: #222; font-weight: 600; border-bottom: 2px solid #fff; margin-bottom: -2px; }
+        .pfr-tab-panel { display: none; padding-top: 16px; }
+        .pfr-tab-panel.pfr-tab-active { display: block; }
+        .pfr-mode-table { border-collapse: collapse; margin-top: 10px; }
+        .pfr-mode-table th, .pfr-mode-table td { border: 1px solid #ddd; padding: 6px 8px; text-align: center; vertical-align: top; }
+        .pfr-mode-table th { background: #f5f5f5; font-weight: 600; }
+        .pfr-mode-example {
+            margin-top: 10px;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background: #fafafa;
+            font-size: 12px;
+            color: #555;
+            max-width: 720px;
+        }
+        .pfr-mode-example table { border-collapse: collapse; margin-top: 8px; }
+        .pfr-mode-example th, .pfr-mode-example td { padding: 4px 10px; text-align: left; }
+        .pfr-mode-warning {
+            margin-top: 10px;
+            padding: 10px 12px;
+            border: 1px solid color-mix(in srgb, #d92d20 40%, #ddd);
+            border-radius: 4px;
+            background: color-mix(in srgb, #d92d20 8%, #fff);
+            font-size: 12px;
+            color: #7a1f16;
+            max-width: 720px;
+        }
+        #pfr-margin-table-wrap { display: none; margin-top: 10px; }
+        .pfr-sim-fields { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; max-width: 720px; }
+        .pfr-sim-fields label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+        .pfr-sim-fields input[type="text"], .pfr-sim-fields select { height: 32px; padding: 0 8px; }
+        .pfr-sim-note {
+            margin-top: 10px;
+            padding: 8px 12px;
+            border: 1px solid color-mix(in srgb, #0d6efd 40%, #ddd);
+            border-radius: 4px;
+            background: color-mix(in srgb, #0d6efd 6%, #fff);
+            font-size: 12px;
+            color: #0a3a7a;
+            max-width: 720px;
+        }
+        .pfr-sim-results { border-collapse: collapse; margin-top: 16px; }
+        .pfr-sim-results th, .pfr-sim-results td { border: 1px solid #ddd; padding: 6px 10px; text-align: center; }
+        .pfr-sim-results th { background: #f5f5f5; font-weight: 600; }
+        .pfr-sim-results td.pfr-sim-free { color: #17803d; }
     </style>
     <div class="pfr-wrap">
         <h3>Taxas MDR - Pagar.me</h3>
@@ -655,6 +1100,16 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
 
         <form method="post" action="<?php echo pagarme_fee_rates_h($moduleLink); ?>" id="pfr-form">
             <input type="hidden" name="csrf_token" value="<?php echo pagarme_fee_rates_h(pagarme_fee_rates_csrfToken()); ?>">
+            <input type="hidden" name="active_tab" id="pfr-active-tab" value="<?php echo pagarme_fee_rates_h($activeTab); ?>">
+
+            <div class="pfr-tabs">
+                <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'taxas' ? ' pfr-tab-active' : ''; ?>" data-tab="taxas">Taxas</button>
+                <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'promo' ? ' pfr-tab-active' : ''; ?>" data-tab="promo">Promoção sem juros</button>
+                <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'modo' ? ' pfr-tab-active' : ''; ?>" data-tab="modo">Modo de Cálculo</button>
+                <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'sim' ? ' pfr-tab-active' : ''; ?>" data-tab="sim">Simulador</button>
+            </div>
+
+            <div class="pfr-tab-panel<?php echo $activeTab === 'taxas' ? ' pfr-tab-active' : ''; ?>" data-tab="taxas">
             <table class="pfr-table">
                 <thead>
                     <tr>
@@ -713,7 +1168,9 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
                 "Outras bandeiras" é usada para Hipercard, Diners e qualquer bandeira não listada.
                 O mínimo de cada célula é o custo real do gateway; não é possível salvar abaixo dele.
             </p>
+            </div>
 
+            <div class="pfr-tab-panel<?php echo $activeTab === 'promo' ? ' pfr-tab-active' : ''; ?>" data-tab="promo">
             <h3 class="pfr-section-title">Promoções sem juros</h3>
             <p class="pfr-hint">
                 Enquanto ativa, TODAS as parcelas da bandeira ficam sem juros, mesmo acima do teto
@@ -781,30 +1238,372 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
                     <?php endforeach; ?>
                 </tbody>
             </table>
+            </div>
 
-            <div class="pfr-actions">
+            <div class="pfr-tab-panel<?php echo $activeTab === 'modo' ? ' pfr-tab-active' : ''; ?>" data-tab="modo">
+            <h3 class="pfr-section-title">Modo de Cálculo</h3>
+            <p class="pfr-hint">
+                Como o juros de parcelamento é calculado quando o cliente escolhe mais de 1x
+                (acima da faixa sem juros do ciclo). Afeta o valor cobrado do cliente - a mesma
+                escolha do cliente entre digitar a parcela e pagar de fato pode acontecer minutos
+                ou horas depois, então o modo ativo no momento da escolha fica preso àquela
+                cobrança, mesmo que este ajuste seja alterado depois.
+            </p>
+
+            <div>
+                <label style="display:block;margin-top:10px;">
+                    <input type="radio" name="mode[formula]" value="simple"
+                        <?php echo (empty($mode['formula']) || $mode['formula'] !== 'compound') ? 'checked' : ''; ?>>
+                    Simples (juros aplicado uma única vez sobre o valor da fatura)
+                </label>
+                <label style="display:block;margin-top:6px;">
+                    <input type="radio" name="mode[formula]" value="compound"
+                        <?php echo (!empty($mode['formula']) && $mode['formula'] === 'compound') ? 'checked' : ''; ?>>
+                    Composta — Tabela Price (juros compostos por parcela, mesmo modelo de financiamento bancário)
+                </label>
+            </div>
+
+            <div id="pfr-mode-compound-warning" class="pfr-mode-warning" style="display:none;">
+                <strong>Atenção:</strong> o modo composto aumenta significativamente o custo para
+                o cliente em parcelamentos longos (o juros incide sobre o juros acumulado a cada
+                parcela, não só sobre o valor original). Confirme com o financeiro antes de ativar
+                em produção.
+            </div>
+
+            <div class="pfr-mode-example">
+                <strong>Exemplo: R$ 1.200,00 em 12x, taxa MDR 3,82%</strong>
+                <table>
+                    <tr><td>Simples</td><td>total R$ 1.245,84 (3,82% aplicado uma vez)</td></tr>
+                    <tr><td>Composta</td><td>total R$ 1.850,55 (3,82% ao mês, composto em 12 parcelas)</td></tr>
+                    <tr><td>+ margem de exemplo (7% em 12x)</td><td>multiplica o total acima por 1,07</td></tr>
+                </table>
+                <p style="margin:6px 0 0;">Valores fixos de exemplo — não recalculados ao vivo conforme os campos abaixo.</p>
+            </div>
+
+            <p class="pfr-hint" style="margin-top:18px;">
+                <label>
+                    <input type="checkbox" name="mode[margin_enabled]" value="1" id="pfr-margin-enabled"
+                        <?php echo !empty($mode['margin_enabled']) ? 'checked' : ''; ?>>
+                    Adicionar margem fixa da loja (percentual extra, somado por cima do cálculo acima —
+                    simples ou composto, nunca somada à taxa MDR antes do cálculo)
+                </label>
+            </p>
+
+            <div id="pfr-margin-table-wrap">
+                <table class="pfr-mode-table">
+                    <thead>
+                        <tr>
+                            <?php for ($n = 1; $n <= 12; $n++): ?>
+                                <th><?php echo $n; ?>x</th>
+                            <?php endfor; ?>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <?php for ($n = 1; $n <= 12; $n++):
+                                $key = (string) $n;
+                                $marginValue = isset($mode['margin'][$key]) ? $mode['margin'][$key] : 0;
+                            ?>
+                                <td>
+                                    <span class="pfr-percent-wrap">
+                                        <input
+                                            type="number"
+                                            step="0.01"
+                                            min="0"
+                                            max="20"
+                                            name="mode[margin][<?php echo $n; ?>]"
+                                            value="<?php echo pagarme_fee_rates_h($marginValue); ?>"
+                                        >
+                                        <span class="pfr-percent-sign" aria-hidden="true">%</span>
+                                    </span>
+                                </td>
+                            <?php endfor; ?>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            </div>
+
+            <div class="pfr-actions pfr-save-actions" style="<?php echo $activeTab === 'sim' ? 'display:none;' : ''; ?>">
                 <button type="submit" name="pagarme_fee_rates_save" value="1" class="btn btn-primary">
                     Salvar
                 </button>
+            </div>
+
+            <div class="pfr-tab-panel<?php echo $activeTab === 'sim' ? ' pfr-tab-active' : ''; ?>" data-tab="sim">
+            <h3 class="pfr-section-title">Simulador</h3>
+            <div class="pfr-sim-note">
+                Esta simulação não altera nenhuma configuração salva — serve só para consulta.
+                Usa as taxas MDR já gravadas na aba "Taxas".
+            </div>
+
+            <?php if ($simResult !== null && !$simResult['success']): ?>
+                <div class="alert alert-danger" style="margin-top:10px;max-width:720px;">
+                    <ul style="margin:0;">
+                        <?php foreach ($simResult['errors'] as $simError): ?>
+                            <li><?php echo pagarme_fee_rates_h($simError); ?></li>
+                        <?php endforeach; ?>
+                    </ul>
+                </div>
+            <?php endif; ?>
+
+            <div class="pfr-sim-fields" style="margin-top:14px;">
+                <div>
+                    <label for="pfr-sim-amount">Valor (R$)</label>
+                    <input
+                        type="text"
+                        inputmode="decimal"
+                        id="pfr-sim-amount"
+                        name="sim[amount]"
+                        value="<?php echo pagarme_fee_rates_h(isset($simInput['amount']) ? $simInput['amount'] : ''); ?>"
+                        placeholder="1200.00"
+                    >
+                </div>
+                <div>
+                    <label for="pfr-sim-brand">Bandeira</label>
+                    <select id="pfr-sim-brand" name="sim[brand]">
+                        <?php foreach (PAGARME_FEE_RATES_BRANDS as $brand): ?>
+                            <option value="<?php echo pagarme_fee_rates_h($brand); ?>"
+                                <?php echo (isset($simInput['brand']) && $simInput['brand'] === $brand) ? 'selected' : ''; ?>>
+                                <?php echo pagarme_fee_rates_h(pagarme_fee_rates_brandLabel($brand)); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div>
+                    <label for="pfr-sim-cycle">Ciclo</label>
+                    <select id="pfr-sim-cycle" name="sim[cycle]">
+                        <?php foreach (pagarme_fee_rates_cycles() as $cycleKey => $cycleInfo): ?>
+                            <option value="<?php echo pagarme_fee_rates_h($cycleKey); ?>"
+                                <?php echo (isset($simInput['cycle']) && $simInput['cycle'] === $cycleKey) ? 'selected' : ''; ?>>
+                                <?php echo pagarme_fee_rates_h($cycleInfo['label']); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+            </div>
+
+            <div style="margin-top:14px;">
+                <label style="display:block;">
+                    <input type="radio" name="sim[formula]" value="simple"
+                        <?php echo (!isset($simInput['formula']) || $simInput['formula'] !== 'compound') ? 'checked' : ''; ?>>
+                    Simples
+                </label>
+                <label style="display:block;margin-top:4px;">
+                    <input type="radio" name="sim[formula]" value="compound"
+                        <?php echo (isset($simInput['formula']) && $simInput['formula'] === 'compound') ? 'checked' : ''; ?>>
+                    Composta (Tabela Price)
+                </label>
+            </div>
+
+            <p class="pfr-hint" style="margin-top:14px;">
+                <label>
+                    <input type="checkbox" name="sim[margin_enabled]" value="1" id="pfr-sim-margin-enabled"
+                        <?php echo !empty($simInput['margin_enabled']) ? 'checked' : ''; ?>>
+                    Simular com margem fixa também
+                </label>
+            </p>
+
+            <div id="pfr-sim-margin-table-wrap" style="display:none;margin-top:10px;">
+                <table class="pfr-mode-table">
+                    <thead>
+                        <tr>
+                            <?php for ($n = 1; $n <= 12; $n++): ?>
+                                <th><?php echo $n; ?>x</th>
+                            <?php endfor; ?>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <?php for ($n = 1; $n <= 12; $n++):
+                                $key = (string) $n;
+                                $simMarginValue = isset($simInput['margin'][$key]) ? $simInput['margin'][$key] : 0;
+                            ?>
+                                <td>
+                                    <span class="pfr-percent-wrap">
+                                        <input
+                                            type="number"
+                                            step="0.01"
+                                            min="0"
+                                            max="20"
+                                            name="sim[margin][<?php echo $n; ?>]"
+                                            value="<?php echo pagarme_fee_rates_h($simMarginValue); ?>"
+                                        >
+                                        <span class="pfr-percent-sign" aria-hidden="true">%</span>
+                                    </span>
+                                </td>
+                            <?php endfor; ?>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="pfr-actions">
+                <button type="submit" name="pagarme_fee_rates_simulate" value="1" class="btn">
+                    Simular
+                </button>
+            </div>
+
+            <?php if ($simResult !== null && $simResult['success']): ?>
+                <table class="pfr-sim-results">
+                    <thead>
+                        <tr>
+                            <th>Parcela</th>
+                            <th>Taxa efetiva</th>
+                            <th>Valor da parcela</th>
+                            <th>Total</th>
+                            <th>Valor inicial</th>
+                            <th>Valor adicional de parcelamento</th>
+                            <th>Taxa de serviço do gateway</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($simResult['rows'] as $row): ?>
+                            <tr>
+                                <td><?php echo (int) $row['installments']; ?>x</td>
+                                <td class="<?php echo $row['interest_free'] ? 'pfr-sim-free' : ''; ?>">
+                                    <?php echo $row['interest_free'] ? 'sem juros' : pagarme_fee_rates_h(number_format($row['rate'], 2, ',', '')) . '%'; ?>
+                                </td>
+                                <td>R$ <?php echo pagarme_fee_rates_h(number_format($row['installment_amount'], 2, ',', '.')); ?></td>
+                                <td>R$ <?php echo pagarme_fee_rates_h(number_format($row['total'], 2, ',', '.')); ?></td>
+                                <td>R$ <?php echo pagarme_fee_rates_h(number_format($row['initial_amount'], 2, ',', '.')); ?></td>
+                                <td>R$ <?php echo pagarme_fee_rates_h(number_format($row['installment_fee'], 2, ',', '.')); ?></td>
+                                <td>R$ <?php echo pagarme_fee_rates_h(number_format($row['gateway_service_fee'], 2, ',', '.')); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+                <p class="pfr-hint">
+                    Ciclo <?php echo pagarme_fee_rates_h($simResult['cycleLabel']); ?>: até
+                    <?php echo (int) $simResult['maxInstallments']; ?>x, sendo até
+                    <?php echo (int) $simResult['freeInstallments']; ?>x sem juros.
+                    "Taxa de serviço do gateway" é o custo MDR real que a Pagar.me cobra da
+                    loja para a faixa de parcelas ESCOLHIDA nesta linha (ex: em 12x, usa a
+                    taxa real de 7-12x), sobre o total — não é o campo "Taxas da Transação"
+                    do WHMCS, que sempre usa a taxa 1x/à vista por decisão de negócio separada.
+                </p>
+            <?php endif; ?>
             </div>
         </form>
     </div>
     <script>
     (function () {
+        // --- Abas ---------------------------------------------------------
+        // O botão "Salvar" (fora de qualquer painel, compartilhado pelas 3
+        // abas que gravam algo) fica oculto na aba "Simulador" - simular
+        // nunca grava, e mostrar "Salvar" ali ao lado de "Simular" confundiria
+        // qual botão faz o quê.
+        var tabButtons = document.querySelectorAll('.pfr-tab-btn');
+        var tabPanels = document.querySelectorAll('.pfr-tab-panel');
+        var saveActions = document.querySelector('.pfr-save-actions');
+        var activeTabField = document.getElementById('pfr-active-tab');
+        function activateTab(target) {
+            for (var j = 0; j < tabButtons.length; j++) {
+                tabButtons[j].classList.toggle('pfr-tab-active', tabButtons[j].getAttribute('data-tab') === target);
+            }
+            for (var k = 0; k < tabPanels.length; k++) {
+                tabPanels[k].classList.toggle('pfr-tab-active', tabPanels[k].getAttribute('data-tab') === target);
+            }
+            if (saveActions) {
+                saveActions.style.display = (target === 'sim') ? 'none' : '';
+            }
+            // Grava qual aba está ativa no campo oculto submetido junto do
+            // form - sem isso, um postback (Salvar ou Simular) sempre
+            // reabriria a página na aba "Taxas" (a marcada como ativa no HTML
+            // inicial), perdendo a aba em que o usuário realmente estava.
+            if (activeTabField) {
+                activeTabField.value = target;
+            }
+        }
+        for (var i = 0; i < tabButtons.length; i++) {
+            tabButtons[i].addEventListener('click', function () {
+                activateTab(this.getAttribute('data-tab'));
+            });
+        }
+
+        // --- Grade de margem: só aparece se a margem estiver ativa --------
+        var marginCheckbox = document.getElementById('pfr-margin-enabled');
+        var marginTableWrap = document.getElementById('pfr-margin-table-wrap');
+        function syncMarginVisibility() {
+            if (marginCheckbox && marginTableWrap) {
+                marginTableWrap.style.display = marginCheckbox.checked ? 'block' : 'none';
+            }
+        }
+        if (marginCheckbox) {
+            marginCheckbox.addEventListener('change', syncMarginVisibility);
+            syncMarginVisibility();
+        }
+
+        // --- Mesmo toggle, para a grade de margem da aba Simulador --------
+        var simMarginCheckbox = document.getElementById('pfr-sim-margin-enabled');
+        var simMarginTableWrap = document.getElementById('pfr-sim-margin-table-wrap');
+        function syncSimMarginVisibility() {
+            if (simMarginCheckbox && simMarginTableWrap) {
+                simMarginTableWrap.style.display = simMarginCheckbox.checked ? 'block' : 'none';
+            }
+        }
+        if (simMarginCheckbox) {
+            simMarginCheckbox.addEventListener('change', syncSimMarginVisibility);
+            syncSimMarginVisibility();
+        }
+
+        // --- Aviso permanente quando "Composta" está selecionada ----------
+        var formulaRadios = document.querySelectorAll('input[name="mode[formula]"]');
+        var compoundWarning = document.getElementById('pfr-mode-compound-warning');
+        function syncCompoundWarning() {
+            var selected = document.querySelector('input[name="mode[formula]"]:checked');
+            if (compoundWarning) {
+                compoundWarning.style.display = (selected && selected.value === 'compound') ? 'block' : 'none';
+            }
+        }
+        for (var m = 0; m < formulaRadios.length; m++) {
+            formulaRadios[m].addEventListener('change', syncCompoundWarning);
+        }
+        syncCompoundWarning();
+
+        // --- Confirmação antes de salvar -----------------------------------
         // Ativar uma promoção zera juros para TODAS as parcelas da bandeira,
         // para todo cliente, a partir do save — impacto financeiro amplo e
         // imediato. Confirmação extra só quando pelo menos uma promoção está
         // marcada como ativa no momento do submit (edição só de taxa não
-        // pede confirmação, para não incomodar o uso mais comum).
+        // pede confirmação, para não incomodar o uso mais comum). Mesmo
+        // padrão para o modo composto: só pede confirmação se o modo estava
+        // "simples" ao carregar a página e o usuário está mudando para
+        // "composto" agora, não em toda gravação com composto já ativo.
+        //
+        // Só se aplica ao botão "Salvar" - "Simular" nunca grava nada, então
+        // nunca precisa dessas confirmações. Rastreado pelo clique no botão
+        // (submitter), já que o evento 'submit' por si só não diz qual botão
+        // disparou o envio.
         var form = document.getElementById('pfr-form');
         if (!form) return;
+        var originalFormula = <?php echo json_encode((!empty($mode['formula']) && $mode['formula'] === 'compound') ? 'compound' : 'simple'); ?>;
+        var lastClickedSubmitName = null;
+        form.addEventListener('click', function (e) {
+            var btn = e.target && e.target.closest ? e.target.closest('button[type="submit"]') : null;
+            if (btn) lastClickedSubmitName = btn.getAttribute('name');
+        });
+
         form.addEventListener('submit', function (e) {
+            if (lastClickedSubmitName !== 'pagarme_fee_rates_save') return;
+
+            var messages = [];
+
             var activeBoxes = form.querySelectorAll('input[name^="promotions["][name$="][active]"]:checked');
-            if (activeBoxes.length === 0) return;
-            var msg = activeBoxes.length === 1
-                ? 'Uma promoção sem juros está marcada como ativa. Isso zera os juros de TODAS as parcelas dessa bandeira, para todo cliente, a partir de agora. Confirmar?'
-                : activeBoxes.length + ' promoções sem juros estão marcadas como ativas. Isso zera os juros de TODAS as parcelas dessas bandeiras, para todo cliente, a partir de agora. Confirmar?';
-            if (!window.confirm(msg)) {
+            if (activeBoxes.length === 1) {
+                messages.push('Uma promoção sem juros está marcada como ativa. Isso zera os juros de TODAS as parcelas dessa bandeira, para todo cliente, a partir de agora.');
+            } else if (activeBoxes.length > 1) {
+                messages.push(activeBoxes.length + ' promoções sem juros estão marcadas como ativas. Isso zera os juros de TODAS as parcelas dessas bandeiras, para todo cliente, a partir de agora.');
+            }
+
+            var selectedFormula = document.querySelector('input[name="mode[formula]"]:checked');
+            if (selectedFormula && selectedFormula.value === 'compound' && originalFormula !== 'compound') {
+                messages.push('Você está ativando o modo de juros COMPOSTO. Isso aumenta significativamente o valor cobrado do cliente em parcelamentos longos.');
+            }
+
+            if (messages.length === 0) return;
+
+            if (!window.confirm(messages.join('\n\n') + '\n\nConfirmar?')) {
                 e.preventDefault();
             }
         });
@@ -815,15 +1614,50 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
 }
 
 /**
+ * Lê e normaliza os campos do formulário de simulação ($_POST['sim']), no
+ * mesmo formato que pagarme_fee_rates_simulate() espera - usado tanto para
+ * rodar a simulação quanto para reexibir o formulário preenchido.
+ *
+ * @param mixed $postedSim
+ * @return array
+ */
+function pagarme_fee_rates_readSimInput($postedSim)
+{
+    if (!is_array($postedSim)) {
+        $postedSim = array();
+    }
+
+    $margin = array();
+    $postedMargin = isset($postedSim['margin']) && is_array($postedSim['margin']) ? $postedSim['margin'] : array();
+    for ($n = 1; $n <= 12; $n++) {
+        $key = (string) $n;
+        $margin[$key] = array_key_exists($key, $postedMargin) ? $postedMargin[$key] : 0;
+    }
+
+    return array(
+        'amount'         => isset($postedSim['amount']) ? $postedSim['amount'] : '',
+        'brand'          => isset($postedSim['brand']) ? (string) $postedSim['brand'] : 'outras',
+        'cycle'          => isset($postedSim['cycle']) ? (string) $postedSim['cycle'] : 'annually',
+        'formula'        => (isset($postedSim['formula']) && $postedSim['formula'] === 'compound') ? 'compound' : 'simple',
+        'margin_enabled' => !empty($postedSim['margin_enabled']),
+        'margin'         => $margin,
+    );
+}
+
+/**
  * Ponto de entrada único do addon. WHMCS roteia GET e POST de
  * addonmodules.php?module=pagarme_fee_rates para esta função.
  *
- * Um único submit grava dois arquivos independentes (taxas e promoções),
- * cada um com sua própria validação e seu próprio log de auditoria — mas
- * como uma única operação do ponto de vista do usuário: se qualquer um dos
- * dois falhar a validação, NADA é gravado (nem taxas nem promoções), e a
- * página reexibe os dois blocos com os valores digitados e os erros de
- * ambos, para o usuário corrigir tudo de uma vez.
+ * Um único submit grava três arquivos independentes (taxas, promoções, modo
+ * de cálculo), cada um com sua própria validação e seu próprio log de
+ * auditoria — mas como uma única operação do ponto de vista do usuário: se
+ * qualquer um dos três falhar a validação, NADA é gravado, e a página
+ * reexibe os três blocos com os valores digitados e os erros de todos, para
+ * o usuário corrigir tudo de uma vez.
+ *
+ * A aba "Simulador" é um quarto submit (`pagarme_fee_rates_simulate`),
+ * tratado à parte: nunca grava nada em disco, nunca loga, e não participa do
+ * tudo-ou-nada das outras três abas.
  *
  * @param array $vars
  */
@@ -832,23 +1666,72 @@ function pagarme_fee_rates_output($vars)
     $taxesPath = pagarme_fee_rates_taxesPath();
     $floorPath = pagarme_fee_rates_floorPath();
     $promotionsPath = pagarme_fee_rates_promotionsPath();
+    $modePath = pagarme_fee_rates_modePath();
     $moduleLink = isset($vars['modulelink']) ? $vars['modulelink'] : 'addonmodules.php?module=pagarme_fee_rates';
 
     $floorTable = pagarme_fee_rates_ensureFloor($taxesPath, $floorPath);
     $floorGrid = pagarme_fee_rates_extractGrid($floorTable);
 
     $isSaveAttempt = $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['pagarme_fee_rates_save']);
+    $isSimulateAttempt = $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['pagarme_fee_rates_simulate']);
 
-    if ($isSaveAttempt && !pagarme_fee_rates_csrfValid(isset($_POST['csrf_token']) ? $_POST['csrf_token'] : null)) {
+    // Qual aba estava selecionada no momento do submit (campo oculto
+    // 'active_tab', atualizado pelo JS a cada clique de aba) - sem isto,
+    // qualquer postback (Salvar ou Simular) sempre reabriria a tela na aba
+    // "Taxas", perdendo onde o usuário realmente estava.
+    $postedActiveTab = isset($_POST['active_tab']) ? (string) $_POST['active_tab'] : 'taxas';
+
+    if (($isSaveAttempt || $isSimulateAttempt)
+        && !pagarme_fee_rates_csrfValid(isset($_POST['csrf_token']) ? $_POST['csrf_token'] : null)
+    ) {
         $currentTaxes = pagarme_fee_rates_loadTable($taxesPath);
         $currentPromotions = pagarme_fee_rates_loadTable($promotionsPath);
+        $currentMode = pagarme_fee_rates_loadTable($modePath);
         echo pagarme_fee_rates_renderForm(
             pagarme_fee_rates_extractGrid($currentTaxes),
             $floorGrid,
             $currentPromotions,
+            $currentMode,
+            pagarme_fee_rates_readSimInput(isset($_POST['sim']) ? $_POST['sim'] : array()),
+            null,
             array('Sessão expirada ou formulário inválido. Recarregue a página e tente novamente.'),
             false,
-            $moduleLink
+            $moduleLink,
+            $postedActiveTab
+        );
+        return;
+    }
+
+    if ($isSimulateAttempt) {
+        $currentTaxes = pagarme_fee_rates_loadTable($taxesPath);
+        $currentPromotions = pagarme_fee_rates_loadTable($promotionsPath);
+        $currentMode = pagarme_fee_rates_loadTable($modePath);
+        $renderRates = pagarme_fee_rates_extractGrid($currentTaxes);
+
+        $simInput = pagarme_fee_rates_readSimInput(isset($_POST['sim']) ? $_POST['sim'] : array());
+        $simResult = pagarme_fee_rates_simulate(
+            $simInput['amount'],
+            $simInput['brand'],
+            $simInput['cycle'],
+            $simInput['formula'],
+            $simInput['margin_enabled'],
+            $simInput['margin'],
+            $currentTaxes
+        );
+
+        echo pagarme_fee_rates_renderForm(
+            $renderRates,
+            $floorGrid,
+            $currentPromotions,
+            $currentMode,
+            $simInput,
+            $simResult,
+            array(),
+            false,
+            $moduleLink,
+            // Sempre 'sim': só se chega aqui submetendo o botão "Simular",
+            // que só existe dentro do painel do Simulador.
+            'sim'
         );
         return;
     }
@@ -856,6 +1739,7 @@ function pagarme_fee_rates_output($vars)
     if ($isSaveAttempt) {
         $currentTaxes = pagarme_fee_rates_loadTable($taxesPath);
         $currentPromotions = pagarme_fee_rates_loadTable($promotionsPath);
+        $currentMode = pagarme_fee_rates_loadTable($modePath);
 
         $taxesResult = pagarme_fee_rates_validateAndBuild(
             isset($_POST['rates']) ? $_POST['rates'] : array(),
@@ -865,18 +1749,25 @@ function pagarme_fee_rates_output($vars)
         $promotionsResult = pagarme_fee_rates_validatePromotions(
             isset($_POST['promotions']) ? $_POST['promotions'] : array()
         );
+        $modeResult = pagarme_fee_rates_validateMode(
+            isset($_POST['mode']) ? $_POST['mode'] : array()
+        );
 
-        $errors = array_merge($taxesResult['errors'], $promotionsResult['errors']);
+        $errors = array_merge($taxesResult['errors'], $promotionsResult['errors'], $modeResult['errors']);
 
-        if ($taxesResult['success'] && $promotionsResult['success']) {
+        if ($taxesResult['success'] && $promotionsResult['success'] && $modeResult['success']) {
             $taxesWriteOk = pagarme_fee_rates_atomicWrite($taxesPath, $taxesResult['data']);
             $promotionsWriteOk = $taxesWriteOk
                 ? pagarme_fee_rates_atomicWrite($promotionsPath, $promotionsResult['data'])
                 : false;
+            $modeWriteOk = $promotionsWriteOk
+                ? pagarme_fee_rates_atomicWrite($modePath, $modeResult['data'])
+                : false;
 
-            if ($taxesWriteOk && $promotionsWriteOk) {
+            if ($taxesWriteOk && $promotionsWriteOk && $modeWriteOk) {
                 pagarme_fee_rates_logChange($currentTaxes, $taxesResult['data']);
                 pagarme_fee_rates_logPromotionChange($currentPromotions, $promotionsResult['data']);
+                pagarme_fee_rates_logModeChange($currentMode, $modeResult['data']);
                 $separator = strpos($moduleLink, '?') !== false ? '&' : '?';
                 header('Location: ' . $moduleLink . $separator . 'saved=1');
                 exit;
@@ -886,6 +1777,7 @@ function pagarme_fee_rates_output($vars)
                 . 'modules/gateways/pagarme/inc/.';
             $renderRates = pagarme_fee_rates_extractGrid($taxesResult['data']);
             $renderPromotions = $promotionsResult['data'];
+            $renderMode = $modeResult['data'];
         } else {
             // Preserva exatamente o que o usuário digitou, incluindo valores inválidos,
             // para não obrigar redigitar tudo por causa de um único campo errado.
@@ -893,19 +1785,35 @@ function pagarme_fee_rates_output($vars)
             $renderPromotions = isset($_POST['promotions']) && is_array($_POST['promotions'])
                 ? $_POST['promotions']
                 : array();
+            $renderMode = isset($_POST['mode']) && is_array($_POST['mode']) ? $_POST['mode'] : array();
         }
 
-        echo pagarme_fee_rates_renderForm($renderRates, $floorGrid, $renderPromotions, $errors, false, $moduleLink);
+        echo pagarme_fee_rates_renderForm(
+            $renderRates,
+            $floorGrid,
+            $renderPromotions,
+            $renderMode,
+            pagarme_fee_rates_readSimInput(array()),
+            null,
+            $errors,
+            false,
+            $moduleLink,
+            $postedActiveTab
+        );
         return;
     }
 
     $currentTaxes = pagarme_fee_rates_loadTable($taxesPath);
     $currentPromotions = pagarme_fee_rates_loadTable($promotionsPath);
+    $currentMode = pagarme_fee_rates_loadTable($modePath);
     $renderRates = pagarme_fee_rates_extractGrid($currentTaxes);
     echo pagarme_fee_rates_renderForm(
         $renderRates,
         $floorGrid,
         $currentPromotions,
+        $currentMode,
+        pagarme_fee_rates_readSimInput(array()),
+        null,
         array(),
         isset($_GET['saved']),
         $moduleLink

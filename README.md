@@ -128,8 +128,9 @@ prefira uma solução via addon em vez de hook customizado.
 
 As taxas MDR usadas no cálculo de juros do parcelamento (`modules/gateways/pagarme/inc/pagarme_credit_card_taxes.json`)
 podem ser editadas direto pelo admin do WHMCS, sem acesso a servidor ou repositório, pelo
-addon `modules/addons/pagarme_fee_rates/`. Pensado para o financeiro: uma grade de bandeira ×
-número de parcelas, com validação e um registro de auditoria de cada alteração.
+addon `modules/addons/pagarme_fee_rates/`. Pensado para o financeiro: uma tela com 4 abas
+("Taxas", "Promoção sem juros", "Modo de Cálculo", "Simulador"), com validação e um registro de
+auditoria de cada alteração.
 
 1. Copie a **pasta inteira** `modules/addons/pagarme_fee_rates/` (com o arquivo
    `pagarme_fee_rates.php` DENTRO dela) para `modules/addons/` na raiz da sua instalação
@@ -184,6 +185,37 @@ separado do log de taxas.
 Como ativar uma promoção zera juros para toda parcela e todo cliente daquela bandeira a partir
 do save, a tela pede uma confirmação extra (`Confirmar?`) sempre que pelo menos uma promoção
 estiver marcada como ativa no momento de salvar — não aparece numa edição só de taxa.
+
+**Modo de cálculo: juros simples ou composto, mais margem fixa opcional.** Aba própria, com duas
+escolhas independentes e combináveis:
+
+- **Fórmula base**: Simples (padrão, comportamento inalterado — a taxa MDR aplicada uma única
+  vez sobre o valor) ou Composta (Tabela Price/Sistema Francês de Amortização, usando a própria
+  taxa MDR cadastrada como taxa mensal composta, aplicada por parcela). O modo composto resulta
+  num total maior para o cliente em parcelamentos longos — a tela mostra um exemplo fixo (R$
+  1.200,00 em 12x) comparando os dois modos, e exige uma confirmação extra ao ativá-lo.
+- **Margem fixa da loja** (opcional, desligada por padrão): um percentual extra por número de
+  parcelas, aplicado **por cima do total já calculado** (simples ou composto), nunca somado à
+  taxa MDR antes do cálculo. Reintroduz o mecanismo do antigo `stay_margins.json` (removido do
+  cálculo em 03/08/2026), agora como toggle configurável em vez de sempre ligado. Sem piso/mínimo
+  — diferente da grade de taxas, é markup discricionário, não custo real de gateway.
+
+Gravado em `modules/gateways/pagarme/inc/pagarme_installment_mode.json`. O modo ativo no momento
+em que o cliente escolhe a parcela fica **preso àquela cobrança** — mesmo que o admin troque o
+modo depois, antes da captura acontecer, o valor cobrado é sempre o que foi exibido ao cliente
+(persistido junto da escolha em `mod_pagarme_installments`). Se o hook opcional
+`includes/hooks/pagarme_installments_selector.php` estiver instalado, o seletor no client area
+também reflete o modo ativo (fórmula, margem e promoção), calculado no servidor — nunca
+reimplementado em JavaScript.
+
+**Simulador.** Aba de consulta separada — nunca altera nenhuma configuração salva, nunca grava
+nada em disco e nunca aparece no Activity Log. Permite testar valor, bandeira, ciclo, fórmula
+(simples/composta) e margem em qualquer combinação, clicando em "Simular" (sem recálculo a cada
+tecla digitada), e ver o resultado por parcela (taxa efetiva, valor da parcela, total) antes de
+decidir o que configurar de verdade na aba "Modo de Cálculo". Usa as taxas MDR **reais** já
+salvas na aba "Taxas" (não uma taxa digitada à mão), então a simulação é fiel ao que uma cobrança
+real faria com aquela bandeira/parcela — mas o botão "Salvar" fica oculto enquanto essa aba está
+ativa, para nunca confundir simular com gravar.
 
 **Controle de taxa: slider + campo numérico.** Cada célula da grade tem um slider ao lado do
 campo numérico, sincronizados — arrastar o slider atualiza o número e vice-versa. O slider não
