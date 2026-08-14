@@ -78,6 +78,53 @@ function pagarme_fee_rates_taxesPath()
 }
 
 /**
+ * Caminho do piso de taxas (snapshot congelado, criado uma vez).
+ *
+ * @return string
+ */
+function pagarme_fee_rates_floorPath()
+{
+    return dirname(dirname(__DIR__))
+        . '/gateways/pagarme/inc/pagarme_credit_card_taxes.floor.json';
+}
+
+/**
+ * Caminho do arquivo de promoções.
+ *
+ * @return string
+ */
+function pagarme_fee_rates_promotionsPath()
+{
+    return dirname(dirname(__DIR__))
+        . '/gateways/pagarme/inc/pagarme_promotions.json';
+}
+
+/**
+ * Garante que o piso de taxas existe, criando-o a partir do arquivo de
+ * taxas ATUAL na primeira vez que esta função roda (nunca depois disso —
+ * uma vez criado, o piso só é alterado manualmente por um dev editando o
+ * arquivo direto, para refletir uma renegociação real com a Pagar.me).
+ *
+ * @param string $taxesPath
+ * @param string $floorPath
+ * @return array O piso (recém-criado ou já existente)
+ */
+function pagarme_fee_rates_ensureFloor($taxesPath, $floorPath)
+{
+    if (is_readable($floorPath)) {
+        return pagarme_fee_rates_loadTable($floorPath);
+    }
+
+    $current = pagarme_fee_rates_loadTable($taxesPath);
+    if (empty($current)) {
+        return array();
+    }
+
+    pagarme_fee_rates_atomicWrite($floorPath, $current);
+    return pagarme_fee_rates_loadTable($floorPath);
+}
+
+/**
  * Lê e decodifica o JSON de taxas. Nunca fatal: qualquer falha (arquivo
  * ilegível, JSON inválido) devolve array vazio, e quem chama trata isso como
  * "sem dado", igual ao padrão de pagarme_loadTable() no módulo de gateway.
@@ -138,17 +185,23 @@ function pagarme_fee_rates_extractGrid($table)
  * se ausente); `debito` é preservado por bandeira do arquivo atual, nunca
  * calculado ou zerado por este addon, já que nada o lê hoje.
  *
+ * O piso (`$floorTable`, snapshot congelado — ver pagarme_fee_rates_ensureFloor())
+ * nunca é editado por esta função; só usado para rejeitar um valor abaixo dele.
+ *
  * @param mixed $postedRates $_POST['rates'] bruto
  * @param array $currentTable Tabela atual, para _comment/debito e diff
+ * @param array $floorTable Piso de taxas (mínimo aceito por célula)
  * @return array{success: bool, data: array|null, errors: string[]}
  */
-function pagarme_fee_rates_validateAndBuild($postedRates, $currentTable)
+function pagarme_fee_rates_validateAndBuild($postedRates, $currentTable, $floorTable = array())
 {
     $errors = array();
 
     if (!is_array($postedRates)) {
         return array('success' => false, 'data' => null, 'errors' => array('Dados do formulário ausentes.'));
     }
+
+    $floorGrid = pagarme_fee_rates_extractGrid($floorTable);
 
     $result = array(
         '_comment' => isset($currentTable['_comment']) && is_string($currentTable['_comment'])
@@ -182,6 +235,12 @@ function pagarme_fee_rates_validateAndBuild($postedRates, $currentTable)
             $value = (float) $raw;
             if ($value < 0 || $value > 20) {
                 $errors[] = "Valor fora da faixa em {$brandLabel} {$n}x: deve estar entre 0 e 20.";
+                continue;
+            }
+
+            $floor = isset($floorGrid[$brand][$key]) ? round((float) $floorGrid[$brand][$key], 2) : 0.0;
+            if (round($value, 2) < $floor) {
+                $errors[] = "Valor abaixo do mínimo em {$brandLabel} {$n}x: mínimo é {$floor}%.";
                 continue;
             }
 
@@ -300,6 +359,118 @@ function pagarme_fee_rates_logChange($before, $after)
 }
 
 /**
+ * Valida o POST de promoções e monta o array pronto para serialização.
+ *
+ * Mecanismo separado da grade de taxas — nunca edita nem lê o piso. Cada
+ * bandeira tem `active` (bool) e `start`/`end` opcionais ('Y-m-d'). Rejeita
+ * a gravação inteira se qualquer bandeira tiver `end` anterior a `start`,
+ * ou uma data em formato inválido.
+ *
+ * @param mixed $postedPromotions $_POST['promotions'] bruto
+ * @return array{success: bool, data: array|null, errors: string[]}
+ */
+function pagarme_fee_rates_validatePromotions($postedPromotions)
+{
+    $errors = array();
+    $result = array();
+
+    if (!is_array($postedPromotions)) {
+        $postedPromotions = array();
+    }
+
+    foreach (PAGARME_FEE_RATES_BRANDS as $brand) {
+        $brandLabel = pagarme_fee_rates_brandLabel($brand);
+        $posted = isset($postedPromotions[$brand]) && is_array($postedPromotions[$brand])
+            ? $postedPromotions[$brand]
+            : array();
+
+        $active = !empty($posted['active']);
+
+        $start = isset($posted['start']) ? trim((string) $posted['start']) : '';
+        $end   = isset($posted['end']) ? trim((string) $posted['end']) : '';
+
+        $datePattern = '/^\d{4}-\d{2}-\d{2}$/';
+        if ($start !== '' && !preg_match($datePattern, $start)) {
+            $errors[] = "Data inválida em Promoções - {$brandLabel}: data de início.";
+            $start = '';
+        }
+        if ($end !== '' && !preg_match($datePattern, $end)) {
+            $errors[] = "Data inválida em Promoções - {$brandLabel}: data de fim.";
+            $end = '';
+        }
+
+        if ($start !== '' && $end !== '' && $end < $start) {
+            $errors[] = "Em Promoções - {$brandLabel}: data de fim não pode ser antes da data de início.";
+        }
+
+        $result[$brand] = array(
+            'active' => $active,
+            'start'  => $start !== '' ? $start : null,
+            'end'    => $end !== '' ? $end : null,
+        );
+    }
+
+    if (!empty($errors)) {
+        return array('success' => false, 'data' => null, 'errors' => $errors);
+    }
+
+    return array('success' => true, 'data' => $result, 'errors' => array());
+}
+
+/**
+ * Registra no Activity Log as promoções que mudaram (ativação/desativação
+ * ou alteração de datas) — separado do log de taxas para não misturar os
+ * dois tipos de mudança na mesma entrada.
+ *
+ * @param array $before
+ * @param array $after
+ */
+function pagarme_fee_rates_logPromotionChange($before, $after)
+{
+    if (!function_exists('logActivity')) {
+        return;
+    }
+
+    try {
+        $changes = array();
+        foreach (PAGARME_FEE_RATES_BRANDS as $brand) {
+            $oldBrand = isset($before[$brand]) ? $before[$brand] : array('active' => false, 'start' => null, 'end' => null);
+            $newBrand = isset($after[$brand]) ? $after[$brand] : array('active' => false, 'start' => null, 'end' => null);
+
+            $oldKey = json_encode($oldBrand);
+            $newKey = json_encode($newBrand);
+            if ($oldKey === $newKey) {
+                continue;
+            }
+
+            $brandLabel = pagarme_fee_rates_brandLabel($brand);
+            if (empty($newBrand['active'])) {
+                $changes[] = "{$brandLabel} desativada";
+                continue;
+            }
+
+            $period = '';
+            if (!empty($newBrand['start']) || !empty($newBrand['end'])) {
+                $period = ' de ' . ($newBrand['start'] ?: '(sem início)') . ' a ' . ($newBrand['end'] ?: '(sem fim)');
+            } else {
+                $period = ' sem prazo definido';
+            }
+            $changes[] = "{$brandLabel} ativada{$period}";
+        }
+
+        if (empty($changes)) {
+            return;
+        }
+
+        $adminId = isset($_SESSION['adminid']) ? (int) $_SESSION['adminid'] : 0;
+        $description = 'Pagar.me - Promoções alteradas: ' . implode('; ', $changes);
+        logActivity(substr($description, 0, 2000), $adminId);
+    } catch (\Throwable $e) {
+        // Log nunca pode derrubar um save que já teve sucesso.
+    }
+}
+
+/**
  * Rótulo de exibição de uma bandeira (para mensagens de erro/log legíveis).
  *
  * @param string $brand
@@ -325,15 +496,19 @@ function pagarme_fee_rates_h($value)
 /**
  * Renderiza a página (formulário + avisos). $values é a grade
  * bandeira => parcela => valor (crua, pode conter o que o usuário acabou de
- * digitar em caso de erro de validação).
+ * digitar em caso de erro de validação). $floorGrid é o piso, mesma forma,
+ * só leitura (nunca editável pela tela). $promotions é
+ * bandeira => {active, start, end}.
  *
  * @param array $values
+ * @param array $floorGrid
+ * @param array $promotions
  * @param string[] $errors
  * @param bool $justSaved
  * @param string $moduleLink
  * @return string
  */
-function pagarme_fee_rates_renderForm($values, $errors, $justSaved, $moduleLink)
+function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors, $justSaved, $moduleLink)
 {
     $groups = array(
         1  => 'g1',
@@ -346,19 +521,27 @@ function pagarme_fee_rates_renderForm($values, $errors, $justSaved, $moduleLink)
     <style>
         .pfr-wrap { max-width: 100%; overflow-x: auto; }
         .pfr-table { border-collapse: collapse; margin-top: 10px; }
-        .pfr-table th, .pfr-table td { border: 1px solid #ddd; padding: 6px 8px; text-align: center; }
+        .pfr-table th, .pfr-table td { border: 1px solid #ddd; padding: 6px 8px; text-align: center; vertical-align: top; }
         .pfr-table th { background: #f5f5f5; font-weight: 600; }
-        .pfr-table td.pfr-brand { text-align: left; font-weight: 600; background: #fafafa; white-space: nowrap; }
+        .pfr-table td.pfr-brand { text-align: left; font-weight: 600; background: #fafafa; white-space: nowrap; vertical-align: middle; }
         .pfr-table th.g1, .pfr-table td.g1 { border-left: 3px solid #999; }
         .pfr-table th.g2, .pfr-table td.g2 { border-left: 3px solid #999; }
         .pfr-table th.g3, .pfr-table td.g3 { border-left: 3px solid #999; }
-        .pfr-table input { width: 64px; text-align: center; }
+        .pfr-cell { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+        .pfr-cell input[type="range"] { width: 72px; }
+        .pfr-cell input[type="number"] { width: 64px; text-align: center; }
+        .pfr-floor-hint { font-size: 10px; color: #999; white-space: nowrap; }
         .pfr-actions { margin-top: 14px; }
         .pfr-hint { color: #666; font-size: 12px; margin-top: 6px; }
+        .pfr-promo-table { border-collapse: collapse; margin-top: 10px; width: 100%; max-width: 720px; }
+        .pfr-promo-table th, .pfr-promo-table td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; }
+        .pfr-promo-table th { background: #f5f5f5; font-weight: 600; }
+        .pfr-promo-table input[type="date"] { width: 140px; }
+        .pfr-section-title { margin-top: 26px; }
     </style>
     <div class="pfr-wrap">
         <h3>Taxas MDR - Pagar.me</h3>
-        <p>Percentual de taxa cobrado por bandeira e número de parcelas. Valores entre 0 e 20.</p>
+        <p>Percentual de taxa cobrado por bandeira e número de parcelas. Valores entre 0 e 20, nunca abaixo do mínimo (custo real do gateway).</p>
 
         <?php if ($justSaved): ?>
             <div class="alert alert-success">Taxas atualizadas com sucesso.</div>
@@ -392,16 +575,32 @@ function pagarme_fee_rates_renderForm($values, $errors, $justSaved, $moduleLink)
                             <?php for ($n = 1; $n <= 12; $n++):
                                 $key = (string) $n;
                                 $value = isset($values[$brand][$key]) ? $values[$brand][$key] : '';
+                                $floor = isset($floorGrid[$brand][$key]) ? (float) $floorGrid[$brand][$key] : 0;
+                                $inputName = "rates[{$brand}][{$n}]";
+                                $inputId = "pfr-rate-{$brand}-{$n}";
                             ?>
                                 <td class="<?php echo $groups[$n]; ?>">
-                                    <input
-                                        type="number"
-                                        step="0.01"
-                                        min="0"
-                                        max="20"
-                                        name="rates[<?php echo pagarme_fee_rates_h($brand); ?>][<?php echo $n; ?>]"
-                                        value="<?php echo pagarme_fee_rates_h($value); ?>"
-                                    >
+                                    <div class="pfr-cell">
+                                        <input
+                                            type="range"
+                                            step="0.01"
+                                            min="<?php echo pagarme_fee_rates_h($floor); ?>"
+                                            max="20"
+                                            value="<?php echo pagarme_fee_rates_h($value !== '' ? $value : $floor); ?>"
+                                            oninput="document.getElementById('<?php echo $inputId; ?>').value = this.value"
+                                        >
+                                        <input
+                                            type="number"
+                                            id="<?php echo $inputId; ?>"
+                                            step="0.01"
+                                            min="<?php echo pagarme_fee_rates_h($floor); ?>"
+                                            max="20"
+                                            name="<?php echo pagarme_fee_rates_h($inputName); ?>"
+                                            value="<?php echo pagarme_fee_rates_h($value); ?>"
+                                            oninput="this.previousElementSibling.value = this.value"
+                                        >
+                                        <span class="pfr-floor-hint">mín. <?php echo pagarme_fee_rates_h(number_format($floor, 2, ',', '')); ?></span>
+                                    </div>
                                 </td>
                             <?php endfor; ?>
                         </tr>
@@ -412,11 +611,60 @@ function pagarme_fee_rates_renderForm($values, $errors, $justSaved, $moduleLink)
             <p class="pfr-hint">
                 As colunas 2x-6x e 7x-12x acompanham as faixas de taxa acordadas com a Pagar.me.
                 "Outras bandeiras" é usada para Hipercard, Diners e qualquer bandeira não listada.
+                O mínimo de cada célula é o custo real do gateway; não é possível salvar abaixo dele.
             </p>
+
+            <h3 class="pfr-section-title">Promoções sem juros</h3>
+            <p class="pfr-hint">
+                Enquanto ativa, TODAS as parcelas da bandeira ficam sem juros, mesmo acima do teto
+                normal do ciclo. Não altera a grade de taxas acima. Datas são opcionais: sem elas,
+                a promoção vale enquanto estiver marcada como ativa.
+            </p>
+            <table class="pfr-promo-table">
+                <thead>
+                    <tr>
+                        <th>Bandeira</th>
+                        <th>Ativa</th>
+                        <th>Início</th>
+                        <th>Fim</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach (PAGARME_FEE_RATES_BRANDS as $brand):
+                        $promo = isset($promotions[$brand]) ? $promotions[$brand] : array('active' => false, 'start' => null, 'end' => null);
+                    ?>
+                        <tr>
+                            <td><?php echo pagarme_fee_rates_h(pagarme_fee_rates_brandLabel($brand)); ?></td>
+                            <td>
+                                <input
+                                    type="checkbox"
+                                    name="promotions[<?php echo pagarme_fee_rates_h($brand); ?>][active]"
+                                    value="1"
+                                    <?php echo !empty($promo['active']) ? 'checked' : ''; ?>
+                                >
+                            </td>
+                            <td>
+                                <input
+                                    type="date"
+                                    name="promotions[<?php echo pagarme_fee_rates_h($brand); ?>][start]"
+                                    value="<?php echo pagarme_fee_rates_h($promo['start'] ?? ''); ?>"
+                                >
+                            </td>
+                            <td>
+                                <input
+                                    type="date"
+                                    name="promotions[<?php echo pagarme_fee_rates_h($brand); ?>][end]"
+                                    value="<?php echo pagarme_fee_rates_h($promo['end'] ?? ''); ?>"
+                                >
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
 
             <div class="pfr-actions">
                 <button type="submit" name="pagarme_fee_rates_save" value="1" class="btn btn-primary">
-                    Salvar taxas
+                    Salvar
                 </button>
             </div>
         </form>
@@ -429,46 +677,82 @@ function pagarme_fee_rates_renderForm($values, $errors, $justSaved, $moduleLink)
  * Ponto de entrada único do addon. WHMCS roteia GET e POST de
  * addonmodules.php?module=pagarme_fee_rates para esta função.
  *
+ * Um único submit grava dois arquivos independentes (taxas e promoções),
+ * cada um com sua própria validação e seu próprio log de auditoria — mas
+ * como uma única operação do ponto de vista do usuário: se qualquer um dos
+ * dois falhar a validação, NADA é gravado (nem taxas nem promoções), e a
+ * página reexibe os dois blocos com os valores digitados e os erros de
+ * ambos, para o usuário corrigir tudo de uma vez.
+ *
  * @param array $vars
  */
 function pagarme_fee_rates_output($vars)
 {
-    $path = pagarme_fee_rates_taxesPath();
+    $taxesPath = pagarme_fee_rates_taxesPath();
+    $floorPath = pagarme_fee_rates_floorPath();
+    $promotionsPath = pagarme_fee_rates_promotionsPath();
     $moduleLink = isset($vars['modulelink']) ? $vars['modulelink'] : 'addonmodules.php?module=pagarme_fee_rates';
+
+    $floorTable = pagarme_fee_rates_ensureFloor($taxesPath, $floorPath);
+    $floorGrid = pagarme_fee_rates_extractGrid($floorTable);
 
     $isSaveAttempt = $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['pagarme_fee_rates_save']);
 
     if ($isSaveAttempt) {
-        $current = pagarme_fee_rates_loadTable($path);
-        $result = pagarme_fee_rates_validateAndBuild(isset($_POST['rates']) ? $_POST['rates'] : array(), $current);
+        $currentTaxes = pagarme_fee_rates_loadTable($taxesPath);
+        $currentPromotions = pagarme_fee_rates_loadTable($promotionsPath);
 
-        if ($result['success']) {
-            $writeOk = pagarme_fee_rates_atomicWrite($path, $result['data']);
+        $taxesResult = pagarme_fee_rates_validateAndBuild(
+            isset($_POST['rates']) ? $_POST['rates'] : array(),
+            $currentTaxes,
+            $floorTable
+        );
+        $promotionsResult = pagarme_fee_rates_validatePromotions(
+            isset($_POST['promotions']) ? $_POST['promotions'] : array()
+        );
 
-            if ($writeOk) {
-                pagarme_fee_rates_logChange($current, $result['data']);
+        $errors = array_merge($taxesResult['errors'], $promotionsResult['errors']);
+
+        if ($taxesResult['success'] && $promotionsResult['success']) {
+            $taxesWriteOk = pagarme_fee_rates_atomicWrite($taxesPath, $taxesResult['data']);
+            $promotionsWriteOk = $taxesWriteOk
+                ? pagarme_fee_rates_atomicWrite($promotionsPath, $promotionsResult['data'])
+                : false;
+
+            if ($taxesWriteOk && $promotionsWriteOk) {
+                pagarme_fee_rates_logChange($currentTaxes, $taxesResult['data']);
+                pagarme_fee_rates_logPromotionChange($currentPromotions, $promotionsResult['data']);
                 $separator = strpos($moduleLink, '?') !== false ? '&' : '?';
                 header('Location: ' . $moduleLink . $separator . 'saved=1');
                 exit;
             }
 
-            $errors = array(
-                'Falha ao gravar o arquivo. Verifique permissões de escrita em '
-                . 'modules/gateways/pagarme/inc/.',
-            );
-            $renderValues = pagarme_fee_rates_extractGrid($result['data']);
+            $errors[] = 'Falha ao gravar o arquivo. Verifique permissões de escrita em '
+                . 'modules/gateways/pagarme/inc/.';
+            $renderRates = pagarme_fee_rates_extractGrid($taxesResult['data']);
+            $renderPromotions = $promotionsResult['data'];
         } else {
-            $errors = $result['errors'];
             // Preserva exatamente o que o usuário digitou, incluindo valores inválidos,
-            // para não obrigar redigitar as 60 células por causa de uma célula errada.
-            $renderValues = isset($_POST['rates']) && is_array($_POST['rates']) ? $_POST['rates'] : array();
+            // para não obrigar redigitar tudo por causa de um único campo errado.
+            $renderRates = isset($_POST['rates']) && is_array($_POST['rates']) ? $_POST['rates'] : array();
+            $renderPromotions = isset($_POST['promotions']) && is_array($_POST['promotions'])
+                ? $_POST['promotions']
+                : array();
         }
 
-        echo pagarme_fee_rates_renderForm($renderValues, $errors, false, $moduleLink);
+        echo pagarme_fee_rates_renderForm($renderRates, $floorGrid, $renderPromotions, $errors, false, $moduleLink);
         return;
     }
 
-    $current = pagarme_fee_rates_loadTable($path);
-    $renderValues = pagarme_fee_rates_extractGrid($current);
-    echo pagarme_fee_rates_renderForm($renderValues, array(), isset($_GET['saved']), $moduleLink);
+    $currentTaxes = pagarme_fee_rates_loadTable($taxesPath);
+    $currentPromotions = pagarme_fee_rates_loadTable($promotionsPath);
+    $renderRates = pagarme_fee_rates_extractGrid($currentTaxes);
+    echo pagarme_fee_rates_renderForm(
+        $renderRates,
+        $floorGrid,
+        $currentPromotions,
+        array(),
+        isset($_GET['saved']),
+        $moduleLink
+    );
 }

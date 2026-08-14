@@ -77,6 +77,24 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         }
     }
 
+    // Promoções "sem juros" por bandeira (configuradas pelo addon de admin
+    // pagarme_fee_rates). Calculado aqui via pagarme_isPromotionActive() -
+    // mesma função que pagarme_customerRate() usa para a cobrança real -
+    // para não reimplementar a janela de datas em JavaScript. Sem isto, o
+    // seletor mostraria juros durante uma promoção ativa, embora a cobrança
+    // real (e o preview de GetPagarmeInstallments) já estivesse sem juros.
+    $promotionsActive = array();
+    if (function_exists('pagarme_isPromotionActive')) {
+        foreach (array('visa', 'mastercard', 'elo', 'amex', 'outras') as $b) {
+            try {
+                $promotionsActive[$b] = pagarme_isPromotionActive($b);
+            } catch (\Throwable $e) {
+                $promotionsActive[$b] = false;
+            }
+        }
+    }
+    $promotionsJson = json_encode($promotionsActive, JSON_UNESCAPED_UNICODE);
+
     // Teto e faixa sem juros por ciclo, DERIVADOS DO MÓDULO em vez de repetidos
     // em JavaScript. Antes eram duas tabelas escritas à mão aqui, que podiam
     // divergir das regras reais sem ninguém perceber - e divergir significa
@@ -134,6 +152,10 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
     // valores aqui: a fonte é pagarme_maxInstallmentsForMonths() /
     // pagarme_freeInstallmentsForMonths().
     var CYCLE_RULES = {$cycleRulesJson};
+    // Promoções "sem juros" ativas agora, por bandeira. Gerado por
+    // pagarme_isPromotionActive() no PHP - não reimplementar a janela de
+    // datas aqui.
+    var PROMOTIONS = {$promotionsJson};
 
     function fmt(v){ return v.toFixed(2).replace('.', ','); }
     function parseMoney(t){
@@ -180,9 +202,11 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         return 'outras';
     }
 
-    // Espelha pagarme_customerRate(): só a taxa MDR, sem margem da loja.
-    // Qualquer divergência aqui faz o cliente ver um valor e ser cobrado outro.
+    // Espelha pagarme_customerRate(): promoção ativa zera antes de qualquer
+    // outra coisa, senão só a taxa MDR, sem margem da loja. Qualquer
+    // divergência aqui faz o cliente ver um valor e ser cobrado outro.
     function getRate(brand, n, free){
+        if(PROMOTIONS[brand]) return 0;
         if(n<=free) return 0;
         var bt=(FEES[brand]&&FEES[brand].credito)||(FEES.outras&&FEES.outras.credito)||{};
         return parseFloat(bt[n])||0;

@@ -321,10 +321,59 @@ function pagarme_mdrRate($brand, $installments)
 }
 
 /**
+ * Se uma promoção "sem juros" está ativa para a bandeira, na data de
+ * referência (hoje, por padrão).
+ *
+ * Configurada em inc/pagarme_promotions.json pelo addon de admin
+ * (modules/addons/pagarme_fee_rates/) — este módulo só lê. `active` é um
+ * interruptor manual independente das datas: permite desligar antes do fim
+ * sem apagar o período configurado. `start`/`end` ausentes (null) tornam a
+ * promoção válida indefinidamente enquanto `active` for true.
+ *
+ * Comparação por string 'Y-m-d' (não strtotime/DateTime): nesse formato a
+ * ordem lexicográfica já é a ordem cronológica, então evita qualquer
+ * ambiguidade de timezone entre o servidor e quem configurou a data.
+ *
+ * @param string      $brand          Bandeira (será normalizada)
+ * @param string|null $referenceDate  'Y-m-d'; null usa a data atual do servidor
+ * @return bool
+ */
+function pagarme_isPromotionActive($brand, $referenceDate = null)
+{
+    $promotions = pagarme_loadTable('pagarme_promotions.json');
+    $brand = pagarme_normalizeBrand($brand);
+
+    if (empty($promotions[$brand]['active'])) {
+        return false;
+    }
+
+    $today = $referenceDate ?: date('Y-m-d');
+    $start = isset($promotions[$brand]['start']) ? $promotions[$brand]['start'] : null;
+    $end   = isset($promotions[$brand]['end']) ? $promotions[$brand]['end'] : null;
+
+    if (!empty($start) && $today < $start) {
+        return false;
+    }
+    if (!empty($end) && $today > $end) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
  * Calcula a taxa (%) repassada ao comprador para um dado número de parcelas.
  *
- * Zero dentro da faixa sem juros; acima dela, a taxa MDR da Pagar.me para
- * aquela bandeira e número de parcelas (pagarme_mdrRate()).
+ * Zero durante uma promoção ativa para a bandeira (pagarme_isPromotionActive()),
+ * OU dentro da faixa sem juros do ciclo; acima dela, a taxa MDR da Pagar.me
+ * para aquela bandeira e número de parcelas (pagarme_mdrRate()).
+ *
+ * Esta é a ÚNICA função que decide juros do comprador — chamada tanto por
+ * pagarme_buildInstallmentOptions() (preview e exibição de fatura) quanto
+ * diretamente por pagarme_capture() (cobrança real, modules/gateways/pagarme.php).
+ * A checagem de promoção precisa morar aqui, e não em
+ * pagarme_buildInstallmentOptions(), para cobrir os três caminhos com uma
+ * única mudança.
  *
  * NÃO soma margem da loja. A margem de `stay_margins.json` existia para cobrir
  * o custo de antecipar recebíveis, e a Stay não antecipa: recebe parcela a
@@ -339,6 +388,10 @@ function pagarme_mdrRate($brand, $installments)
  */
 function pagarme_customerRate($brand, $installments, $freeInstallments)
 {
+    if (pagarme_isPromotionActive($brand)) {
+        return 0.0;
+    }
+
     if ($installments <= $freeInstallments) {
         return 0.0;
     }

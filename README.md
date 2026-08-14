@@ -158,6 +158,33 @@ aceitos: 0 a 20 (%); qualquer célula ausente ou fora da faixa rejeita o salvame
 sem gravar parcialmente. O arquivo `stay_margins.json` (não usado no cálculo hoje) não é
 editável por essa tela.
 
+**Piso de taxa (mínimo, protege contra digitar abaixo do custo do gateway).** Na primeira vez
+que a tela é aberta após esta atualização, o addon cria automaticamente
+`modules/gateways/pagarme/inc/pagarme_credit_card_taxes.floor.json`, um retrato congelado das
+taxas então em vigor. A partir daí, nenhuma célula pode ser salva abaixo do valor correspondente
+nesse arquivo — a tela mostra o mínimo de cada célula abaixo do campo. O addon nunca reescreve
+esse arquivo sozinho depois de criado; se a Pagar.me renegociar as taxas reais no futuro (para
+baixo), um dev precisa editar `pagarme_credit_card_taxes.floor.json` manualmente para refletir
+o novo piso.
+
+**Promoções sem juros por bandeira.** Abaixo da grade de taxas, uma seção separada permite
+marcar uma bandeira como "sem juros" por um período (datas de início/fim opcionais) ou
+indefinidamente enquanto ativa. Isso NÃO edita a grade de taxas acima — é um interruptor à
+parte, verificado em tempo real por `pagarme_isPromotionActive()`
+(`modules/gateways/pagarme/installments.php`), a mesma função usada tanto no preview quanto na
+cobrança real. Enquanto ativa, TODAS as parcelas daquela bandeira ficam sem juros,
+independente do teto normal do ciclo. Guardado em
+`modules/gateways/pagarme/inc/pagarme_promotions.json`, com log próprio no Activity Log,
+separado do log de taxas.
+
+> Se o hook opcional `includes/hooks/pagarme_installments_selector.php` (seção "Ativar" acima)
+> estiver instalado, ele também respeita a promoção ativa — o seletor de parcelas no client
+> area não mostra juros durante o período promocional, consistente com o que será cobrado.
+
+**Controle de taxa: slider + campo numérico.** Cada célula da grade tem um slider ao lado do
+campo numérico, sincronizados — arrastar o slider atualiza o número e vice-versa. O slider não
+permite arrastar abaixo do piso da célula.
+
 **Atalho na tela inicial do admin (opcional).** Para não depender de encontrar o addon dentro
 de "Aplicativos e Integrações" toda vez, copie `includes/hooks/pagarme_fee_rates_widget.php`
 para `/includes/hooks/` do seu WHMCS. Ele adiciona um card na Home do admin com um link direto
