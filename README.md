@@ -10,6 +10,8 @@ para cobranças recorrentes.
 modules/gateways/pagarme.php                        → módulo principal do gateway
 modules/gateways/pagarme/pagarmeapi.php             → cliente HTTP da API Pagar.me
 modules/gateways/callback/pagarme.php               → webhook (confirmação assíncrona)
+modules/addons/pagarme_fee_rates/                   → addon opcional (edição de taxas MDR pelo admin)
+includes/hooks/pagarme_fee_rates_widget.php        → hook opcional (atalho na Home do admin)
 includes/hooks/suppress_zero_invoice_emails.php    → hook opcional (faturas R$ 0,00)
 ```
 
@@ -121,6 +123,49 @@ o total é R$ 0,00, sem alterar o fluxo de cobrança.
 Existe também um addon pago no WHMCS Marketplace ("Zero Invoice Management") que
 oferece uma opção de configuração para evitar a criação de faturas de R$ 0,00, caso
 prefira uma solução via addon em vez de hook customizado.
+
+## 8. Editando as taxas MDR pelo admin (addon "Pagar.me - Taxas MDR")
+
+As taxas MDR usadas no cálculo de juros do parcelamento (`modules/gateways/pagarme/inc/pagarme_credit_card_taxes.json`)
+podem ser editadas direto pelo admin do WHMCS, sem acesso a servidor ou repositório, pelo
+addon `modules/addons/pagarme_fee_rates/`. Pensado para o financeiro: uma grade de bandeira ×
+número de parcelas, com validação e um registro de auditoria de cada alteração.
+
+1. Copie a **pasta inteira** `modules/addons/pagarme_fee_rates/` (com o arquivo
+   `pagarme_fee_rates.php` DENTRO dela) para `modules/addons/` na raiz da sua instalação
+   WHMCS. O WHMCS exige que cada addon tenha sua própria pasta com o mesmo nome do arquivo
+   principal — só o `.php` solto em `modules/addons/`, sem a pasta ao redor, não é reconhecido
+   como addon.
+2. Acesse **Setup > Addon Modules** (em versões recentes do WHMCS, o menu foi renomeado para
+   **Aplicativos e Integrações**), localize **"Pagar.me - Taxas MDR"** na lista e clique em
+   **Activate**.
+3. Para dar acesso só a essa tela (sem tornar ninguém admin geral): **Configuration > System
+   Settings > Admin Roles**, abra o papel do financeiro (ou crie um novo, restrito, se ainda
+   não existir), na aba **Addon Modules** marque **"Pagar.me - Taxas MDR"**, e atribua os
+   usuários do financeiro a esse papel.
+
+> Pular o passo 2 ou 3 faz o addon não aparecer no menu, ou não aparecer para o papel do
+> financeiro, mesmo com a pasta já copiada no lugar certo — mesmo aviso que vale para as
+> custom API actions (ver `includes/api/README.md`).
+
+Depois de ativado, o acesso à tela varia com a versão/tema do admin: em instalações mais
+recentes costuma ficar em **Aplicativos e Integrações > Pagar.me - Taxas MDR** (clique no
+addon, depois em **"Usar o aplicativo"** no popup); em instalações mais antigas, direto em
+**Addons > Pagar.me - Taxas MDR**. Cada alteração salva
+grava o JSON de forma atômica (nunca fica meio escrito, mesmo se a requisição cair no meio) e
+registra um resumo do que mudou no **Activity Log** do WHMCS, com o admin responsável. Valores
+aceitos: 0 a 20 (%); qualquer célula ausente ou fora da faixa rejeita o salvamento inteiro,
+sem gravar parcialmente. O arquivo `stay_margins.json` (não usado no cálculo hoje) não é
+editável por essa tela.
+
+**Atalho na tela inicial do admin (opcional).** Para não depender de encontrar o addon dentro
+de "Aplicativos e Integrações" toda vez, copie `includes/hooks/pagarme_fee_rates_widget.php`
+para `/includes/hooks/` do seu WHMCS. Ele adiciona um card na Home do admin com um link direto
+para a tela de taxas — carrega automaticamente, sem passo de ativação. O card só aparece para
+administradores com acesso ao addon `pagarme_fee_rates` (mesma permissão de Admin Roles do
+passo 3 acima); para o "Full Administrator" aparece sempre. O WHMCS não tem uma forma
+documentada/estável de adicionar item ao menu superior do admin (só a Home tem uma API de
+widget oficial), por isso o atalho é um card na Home, não uma entrada de menu.
 
 ## Observações importantes
 
