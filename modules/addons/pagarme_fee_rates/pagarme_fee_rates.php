@@ -774,13 +774,10 @@ function pagarme_fee_rates_parseAmount($raw)
  * taxa de serviço do gateway) mostra: base da fatura; o juros repassado ao
  * CLIENTE (0 dentro da faixa sem juros); e o custo MDR REAL que a Pagar.me
  * cobra da loja pela FAIXA de parcelas escolhida (ex: 12x usa a taxa real de
- * 7-12x, não a de 1x), sobre o total. Esta terceira coluna é
- * DELIBERADAMENTE DIFERENTE do campo interno real do WHMCS
- * (pagarme_transactionFeeAmount(), que desde 14/08/2026 sempre usa a taxa
- * 1x/à vista por decisão de negócio) - aqui o objetivo é mostrar o custo
- * real da Pagar.me para aquela faixa específica, útil para decidir se vale
- * repassar mais ou menos juros, não replicar o que fica escriturado no
- * WHMCS.
+ * 7-12x, não a de 1x), sobre o total. Esta terceira coluna espelha o campo
+ * interno real do WHMCS (pagarme_transactionFeeAmount($chargeAmount, $brand,
+ * $installments) em pagarme.php - usa a taxa da faixa real desde a reversão
+ * de 14/08/2026), replicada aqui pela mesma nota de isolamento acima.
  *
  * @param mixed  $amount        Valor a simular, texto livre (BR ou US) - ver pagarme_fee_rates_parseAmount()
  * @param string $brand         Bandeira (uma das PAGARME_FEE_RATES_BRANDS)
@@ -864,12 +861,9 @@ function pagarme_fee_rates_simulate($amount, $brand, $cycleKey, $formula, $margi
         $effectiveRate = $amount > 0 ? round((($total - $amount) / $amount) * 100, 4) : 0.0;
         $installmentFee = round($total - $amount, 2);
         // Taxa de serviço do gateway, na simulação: a taxa MDR REAL da faixa
-        // escolhida (não fixa em 1x) sobre o total - decisão confirmada com o
-        // usuário em 14/08/2026, distinta da regra do campo interno REAL do
-        // WHMCS (pagarme_transactionFeeAmount(), sempre 1x, ver Fase 16) - a
-        // simulação mostra o custo real da Pagar.me para AQUELA faixa de
-        // parcelas, não o que acaba escriturado no WHMCS por decisão de
-        // negócio separada.
+        // escolhida (não fixa em 1x) sobre o total - mesma regra do campo
+        // interno real do WHMCS (pagarme_transactionFeeAmount() em
+        // pagarme.php, taxa da faixa real desde a reversão de 14/08/2026).
         $gatewayServiceFee = round($total * ($realMdrRate / 100), 2);
 
         $rows[] = array(
@@ -1479,8 +1473,8 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
                     <?php echo (int) $simResult['freeInstallments']; ?>x sem juros.
                     "Taxa de serviço do gateway" é o custo MDR real que a Pagar.me cobra da
                     loja para a faixa de parcelas ESCOLHIDA nesta linha (ex: em 12x, usa a
-                    taxa real de 7-12x), sobre o total — não é o campo "Taxas da Transação"
-                    do WHMCS, que sempre usa a taxa 1x/à vista por decisão de negócio separada.
+                    taxa real de 7-12x), sobre o total — o mesmo valor que aparece como
+                    "Taxas da Transação" na fatura real.
                 </p>
             <?php endif; ?>
             </div>
