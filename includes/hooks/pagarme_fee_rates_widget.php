@@ -65,6 +65,54 @@ function pagarme_fee_rates_widget_hasAccess()
     }
 }
 
+/**
+ * Quantas bandeiras têm promoção "sem juros" ativa agora, lendo
+ * pagarme_promotions.json diretamente (mesmo motivo do resto deste
+ * arquivo: isolamento do módulo de gateway, sem require). Duplica a mesma
+ * janela de datas de pagarme_isPromotionActive() — se a regra de datas
+ * mudar lá, atualizar aqui também.
+ *
+ * Nunca fatal: qualquer falha de leitura devolve 0, sem quebrar o widget.
+ *
+ * @return int
+ */
+function pagarme_fee_rates_widget_activePromotionsCount()
+{
+    try {
+        $path = dirname(dirname(__DIR__))
+            . '/modules/gateways/pagarme/inc/pagarme_promotions.json';
+        if (!is_readable($path)) {
+            return 0;
+        }
+
+        $decoded = json_decode(file_get_contents($path), true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($decoded)) {
+            return 0;
+        }
+
+        $today = date('Y-m-d');
+        $count = 0;
+        foreach ($decoded as $promo) {
+            if (empty($promo['active'])) {
+                continue;
+            }
+            $start = isset($promo['start']) ? $promo['start'] : null;
+            $end   = isset($promo['end']) ? $promo['end'] : null;
+            if (!empty($start) && $today < $start) {
+                continue;
+            }
+            if (!empty($end) && $today > $end) {
+                continue;
+            }
+            $count++;
+        }
+
+        return $count;
+    } catch (\Throwable $e) {
+        return 0;
+    }
+}
+
 class PagarmeFeeRatesHomeWidget extends \WHMCS\Module\AbstractWidget
 {
     protected $title = 'Pagar.me - Taxas MDR';
@@ -75,12 +123,24 @@ class PagarmeFeeRatesHomeWidget extends \WHMCS\Module\AbstractWidget
 
     public function getData()
     {
-        return array();
+        return array('activePromotions' => pagarme_fee_rates_widget_activePromotionsCount());
     }
 
     public function generateOutput($data)
     {
+        $activePromotions = isset($data['activePromotions']) ? (int) $data['activePromotions'] : 0;
+
+        $badge = '';
+        if ($activePromotions > 0) {
+            $label = $activePromotions === 1 ? '1 promoção ativa' : $activePromotions . ' promoções ativas';
+            $badge = '<span style="display:inline-block;margin-bottom:8px;padding:2px 8px;'
+                . 'border-radius:10px;background:#fff3cd;color:#856404;font-size:11px;font-weight:600;">'
+                . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
+                . '</span><br>';
+        }
+
         return '<div style="padding:4px 0;">'
+            . $badge
             . '<p style="margin:0 0 10px;color:#666;">'
             . 'Ajuste os percentuais de taxa por bandeira e número de parcelas.'
             . '</p>'

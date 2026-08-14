@@ -30,6 +30,52 @@ if (!defined('WHMCS')) {
 const PAGARME_FEE_RATES_BRANDS = array('visa', 'mastercard', 'elo', 'amex', 'outras');
 const PAGARME_FEE_RATES_DEFAULT_COMMENT =
     'Taxas MDR reais da Pagar.me (Stone). Faixas da proposta: 1x (a vista), 2-6x, 7-12x.';
+const PAGARME_FEE_RATES_CSRF_SESSION_KEY = 'pagarme_fee_rates_csrf';
+
+/**
+ * Token anti-CSRF por sessão. O WHMCS não expõe um mecanismo de CSRF
+ * padronizado para Addon Modules (diferente de hooks de client area, que
+ * recebem $vars['token']) — confirmado ausente na documentação oficial e em
+ * pedido de feature aberto há anos sem resolução. Sem isto, um site externo
+ * poderia montar um formulário oculto apontando para
+ * addonmodules.php?module=pagarme_fee_rates e, se um admin logado visitasse
+ * essa página, o browser enviaria a sessão automaticamente — alterando
+ * taxas sem o admin saber.
+ *
+ * Um token por sessão (não por formulário) é suficiente aqui: a tela não
+ * tem múltiplos formulários simultâneos, e reemitir a cada carga só
+ * quebraria abrir a tela em duas abas.
+ *
+ * @return string
+ */
+function pagarme_fee_rates_csrfToken()
+{
+    if (empty($_SESSION[PAGARME_FEE_RATES_CSRF_SESSION_KEY])) {
+        $_SESSION[PAGARME_FEE_RATES_CSRF_SESSION_KEY] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION[PAGARME_FEE_RATES_CSRF_SESSION_KEY];
+}
+
+/**
+ * Valida o token anti-CSRF enviado no POST contra o da sessão, com
+ * comparação em tempo constante (hash_equals) para não vazar o valor
+ * correto por diferença de tempo de resposta.
+ *
+ * @param mixed $submitted
+ * @return bool
+ */
+function pagarme_fee_rates_csrfValid($submitted)
+{
+    $expected = isset($_SESSION[PAGARME_FEE_RATES_CSRF_SESSION_KEY])
+        ? $_SESSION[PAGARME_FEE_RATES_CSRF_SESSION_KEY]
+        : null;
+
+    if (!$expected || !is_string($submitted) || $submitted === '') {
+        return false;
+    }
+
+    return hash_equals($expected, $submitted);
+}
 
 /**
  * Config do addon (nome/descrição/versão). Sem campos de configuração
@@ -327,13 +373,14 @@ function pagarme_fee_rates_logChange($before, $after)
     try {
         $changes = array();
         foreach (PAGARME_FEE_RATES_BRANDS as $brand) {
+            $brandLabel = pagarme_fee_rates_brandLabel($brand);
             for ($n = 1; $n <= 12; $n++) {
                 $key = (string) $n;
                 $old = round((float) (isset($before[$brand]['credito'][$key]) ? $before[$brand]['credito'][$key] : 0), 2);
                 $new = round((float) (isset($after[$brand]['credito'][$key]) ? $after[$brand]['credito'][$key] : 0), 2);
 
                 if ($old !== $new) {
-                    $changes[] = "{$brand} {$n}x: {$old}% -> {$new}%";
+                    $changes[] = "{$brandLabel} {$n}x: {$old}% -> {$new}%";
                 }
             }
         }
@@ -528,8 +575,37 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
         .pfr-table th.g2, .pfr-table td.g2 { border-left: 3px solid #999; }
         .pfr-table th.g3, .pfr-table td.g3 { border-left: 3px solid #999; }
         .pfr-cell { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+        /* Slider só aparece com o mouse sobre a célula da taxa (td.g1/g2/g3),
+           não só sobre o próprio input — pedido de UI, evita 60 sliders
+           visíveis ao mesmo tempo. visibility (não display) para o espaço
+           ficar sempre reservado, sem a tabela "pular" no hover, e para
+           navegação por teclado (:focus-within) continuar revelando o
+           slider quando o campo numérico recebe foco via Tab. */
+        .pfr-table td.g1 input[type="range"],
+        .pfr-table td.g2 input[type="range"],
+        .pfr-table td.g3 input[type="range"] {
+            visibility: hidden;
+        }
+        .pfr-table td.g1:hover input[type="range"],
+        .pfr-table td.g2:hover input[type="range"],
+        .pfr-table td.g3:hover input[type="range"],
+        .pfr-table td.g1:focus-within input[type="range"],
+        .pfr-table td.g2:focus-within input[type="range"],
+        .pfr-table td.g3:focus-within input[type="range"] {
+            visibility: visible;
+        }
         .pfr-cell input[type="range"] { width: 72px; }
-        .pfr-cell input[type="number"] { width: 64px; text-align: center; }
+        .pfr-percent-wrap { position: relative; display: inline-block; }
+        .pfr-percent-wrap input[type="number"] { width: 64px; padding-right: 16px; text-align: center; }
+        .pfr-percent-sign {
+            position: absolute;
+            right: 5px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 11px;
+            color: #999;
+            pointer-events: none;
+        }
         .pfr-floor-hint { font-size: 10px; color: #999; white-space: nowrap; }
         .pfr-actions { margin-top: 14px; }
         .pfr-hint { color: #666; font-size: 12px; margin-top: 6px; }
@@ -538,6 +614,25 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
         .pfr-promo-table th { background: #f5f5f5; font-weight: 600; }
         .pfr-promo-table input[type="date"] { width: 140px; }
         .pfr-section-title { margin-top: 26px; }
+        .pfr-promo-dates-hint {
+            margin-top: 10px;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background: #fafafa;
+            font-size: 12px;
+            color: #555;
+            max-width: 720px;
+        }
+        .pfr-promo-dates-cols {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            margin-top: 8px;
+        }
+        .pfr-promo-dates-cols > div { flex: 1 1 260px; min-width: 220px; }
+        .pfr-promo-dates-cols ul { margin: 4px 0 0; padding-left: 18px; }
+        .pfr-promo-dates-cols li { margin-bottom: 2px; }
     </style>
     <div class="pfr-wrap">
         <h3>Taxas MDR - Pagar.me</h3>
@@ -558,7 +653,8 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
             </div>
         <?php endif; ?>
 
-        <form method="post" action="<?php echo pagarme_fee_rates_h($moduleLink); ?>">
+        <form method="post" action="<?php echo pagarme_fee_rates_h($moduleLink); ?>" id="pfr-form">
+            <input type="hidden" name="csrf_token" value="<?php echo pagarme_fee_rates_h(pagarme_fee_rates_csrfToken()); ?>">
             <table class="pfr-table">
                 <thead>
                     <tr>
@@ -583,22 +679,26 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
                                     <div class="pfr-cell">
                                         <input
                                             type="range"
+                                            id="<?php echo $inputId; ?>-range"
                                             step="0.01"
                                             min="<?php echo pagarme_fee_rates_h($floor); ?>"
                                             max="20"
                                             value="<?php echo pagarme_fee_rates_h($value !== '' ? $value : $floor); ?>"
                                             oninput="document.getElementById('<?php echo $inputId; ?>').value = this.value"
                                         >
-                                        <input
-                                            type="number"
-                                            id="<?php echo $inputId; ?>"
-                                            step="0.01"
-                                            min="<?php echo pagarme_fee_rates_h($floor); ?>"
-                                            max="20"
-                                            name="<?php echo pagarme_fee_rates_h($inputName); ?>"
-                                            value="<?php echo pagarme_fee_rates_h($value); ?>"
-                                            oninput="this.previousElementSibling.value = this.value"
-                                        >
+                                        <span class="pfr-percent-wrap">
+                                            <input
+                                                type="number"
+                                                id="<?php echo $inputId; ?>"
+                                                step="0.01"
+                                                min="<?php echo pagarme_fee_rates_h($floor); ?>"
+                                                max="20"
+                                                name="<?php echo pagarme_fee_rates_h($inputName); ?>"
+                                                value="<?php echo pagarme_fee_rates_h($value); ?>"
+                                                oninput="document.getElementById('<?php echo $inputId; ?>-range').value = this.value"
+                                            >
+                                            <span class="pfr-percent-sign" aria-hidden="true">%</span>
+                                        </span>
                                         <span class="pfr-floor-hint">mín. <?php echo pagarme_fee_rates_h(number_format($floor, 2, ',', '')); ?></span>
                                     </div>
                                 </td>
@@ -620,6 +720,26 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
                 normal do ciclo. Não altera a grade de taxas acima. Datas são opcionais: sem elas,
                 a promoção vale enquanto estiver marcada como ativa.
             </p>
+            <div class="pfr-promo-dates-hint">
+                <strong>Sobre as horas do dia selecionado:</strong> a data não tem horário próprio
+                — o dia inteiro conta, do início ao fim.
+                <div class="pfr-promo-dates-cols">
+                    <div>
+                        <strong>Data de início</strong>
+                        <ul>
+                            <li>Vale a partir de 00h00 daquele dia.</li>
+                            <li>Ex.: início em 01/09 já vale às 00h01 do dia 1.</li>
+                        </ul>
+                    </div>
+                    <div>
+                        <strong>Data de fim</strong>
+                        <ul>
+                            <li>Vale até 23h59 daquele dia (o dia inteiro conta).</li>
+                            <li>Ex.: fim em 30/09 ainda vale às 23h50 do dia 30, mas não mais no dia 1º/10.</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
             <table class="pfr-promo-table">
                 <thead>
                     <tr>
@@ -669,6 +789,27 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $errors,
             </div>
         </form>
     </div>
+    <script>
+    (function () {
+        // Ativar uma promoção zera juros para TODAS as parcelas da bandeira,
+        // para todo cliente, a partir do save — impacto financeiro amplo e
+        // imediato. Confirmação extra só quando pelo menos uma promoção está
+        // marcada como ativa no momento do submit (edição só de taxa não
+        // pede confirmação, para não incomodar o uso mais comum).
+        var form = document.getElementById('pfr-form');
+        if (!form) return;
+        form.addEventListener('submit', function (e) {
+            var activeBoxes = form.querySelectorAll('input[name^="promotions["][name$="][active]"]:checked');
+            if (activeBoxes.length === 0) return;
+            var msg = activeBoxes.length === 1
+                ? 'Uma promoção sem juros está marcada como ativa. Isso zera os juros de TODAS as parcelas dessa bandeira, para todo cliente, a partir de agora. Confirmar?'
+                : activeBoxes.length + ' promoções sem juros estão marcadas como ativas. Isso zera os juros de TODAS as parcelas dessas bandeiras, para todo cliente, a partir de agora. Confirmar?';
+            if (!window.confirm(msg)) {
+                e.preventDefault();
+            }
+        });
+    })();
+    </script>
     <?php
     return ob_get_clean();
 }
@@ -697,6 +838,20 @@ function pagarme_fee_rates_output($vars)
     $floorGrid = pagarme_fee_rates_extractGrid($floorTable);
 
     $isSaveAttempt = $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['pagarme_fee_rates_save']);
+
+    if ($isSaveAttempt && !pagarme_fee_rates_csrfValid(isset($_POST['csrf_token']) ? $_POST['csrf_token'] : null)) {
+        $currentTaxes = pagarme_fee_rates_loadTable($taxesPath);
+        $currentPromotions = pagarme_fee_rates_loadTable($promotionsPath);
+        echo pagarme_fee_rates_renderForm(
+            pagarme_fee_rates_extractGrid($currentTaxes),
+            $floorGrid,
+            $currentPromotions,
+            array('Sessão expirada ou formulário inválido. Recarregue a página e tente novamente.'),
+            false,
+            $moduleLink
+        );
+        return;
+    }
 
     if ($isSaveAttempt) {
         $currentTaxes = pagarme_fee_rates_loadTable($taxesPath);

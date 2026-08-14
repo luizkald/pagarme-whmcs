@@ -181,9 +181,18 @@ separado do log de taxas.
 > estiver instalado, ele também respeita a promoção ativa — o seletor de parcelas no client
 > area não mostra juros durante o período promocional, consistente com o que será cobrado.
 
+Como ativar uma promoção zera juros para toda parcela e todo cliente daquela bandeira a partir
+do save, a tela pede uma confirmação extra (`Confirmar?`) sempre que pelo menos uma promoção
+estiver marcada como ativa no momento de salvar — não aparece numa edição só de taxa.
+
 **Controle de taxa: slider + campo numérico.** Cada célula da grade tem um slider ao lado do
 campo numérico, sincronizados — arrastar o slider atualiza o número e vice-versa. O slider não
 permite arrastar abaixo do piso da célula.
+
+**Proteção contra CSRF.** O formulário usa um token por sessão, validado a cada salvamento —
+sem ele, um link malicioso visitado por um admin logado poderia alterar as taxas sem o admin
+perceber. Se a sessão expirar ou o token não bater, o salvamento é recusado com uma mensagem
+pedindo para recarregar a página.
 
 **Atalho na tela inicial do admin (opcional).** Para não depender de encontrar o addon dentro
 de "Aplicativos e Integrações" toda vez, copie `includes/hooks/pagarme_fee_rates_widget.php`
@@ -193,6 +202,9 @@ administradores com acesso ao addon `pagarme_fee_rates` (mesma permissão de Adm
 passo 3 acima); para o "Full Administrator" aparece sempre. O WHMCS não tem uma forma
 documentada/estável de adicionar item ao menu superior do admin (só a Home tem uma API de
 widget oficial), por isso o atalho é um card na Home, não uma entrada de menu.
+
+Quando há pelo menos uma promoção ativa, o card mostra um selo ("N promoções ativas") — lembrete
+rápido sem precisar abrir a tela e ler a tabela inteira.
 
 ## Observações importantes
 
