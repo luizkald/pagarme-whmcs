@@ -190,10 +190,17 @@ estiver marcada como ativa no momento de salvar — não aparece numa edição s
 escolhas independentes e combináveis:
 
 - **Fórmula base**: Simples (padrão, comportamento inalterado — a taxa MDR aplicada uma única
-  vez sobre o valor) ou Composta (Tabela Price/Sistema Francês de Amortização, usando a própria
-  taxa MDR cadastrada como taxa mensal composta, aplicada por parcela). O modo composto resulta
-  num total maior para o cliente em parcelamentos longos — a tela mostra um exemplo fixo (R$
-  1.200,00 em 12x) comparando os dois modos, e exige uma confirmação extra ao ativá-lo.
+  vez sobre o valor) ou Composta (Tabela Price/Sistema Francês de Amortização, aplicada por
+  parcela). O modo composto resulta num total maior para o cliente em parcelamentos longos — a
+  tela mostra um exemplo fixo (R$ 1.200,00 em 12x) comparando os dois modos, e exige uma
+  confirmação extra ao ativá-lo.
+  - **Fonte da taxa composta**, sub-opção só visível quando "Composta" está marcada: usar a
+    própria taxa MDR cadastrada na aba Taxas (padrão, varia por bandeira e parcela como
+    sempre), ou uma **taxa personalizada única** (um só campo, sem piso/mínimo — pode ser
+    menor que o custo real do gateway sem risco para a loja — que vale igual para qualquer
+    bandeira e qualquer número de parcelas). Em qualquer dos dois casos, a taxa personalizada
+    nunca decide SE uma parcela tem juros (isso continua vindo só do teto do ciclo e da aba
+    "Promoção sem juros") — só decide QUANTO compor, depois que já foi decidido que há juros.
 - **Margem fixa da loja** (opcional, desligada por padrão): um percentual extra por número de
   parcelas, aplicado **por cima do total já calculado** (simples ou composto), nunca somado à
   taxa MDR antes do cálculo. Reintroduz o mecanismo do antigo `stay_margins.json` (removido do

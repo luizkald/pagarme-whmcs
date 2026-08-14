@@ -199,9 +199,11 @@ function pagarme_capture($params)
     $modeOverride = null;
     if (isset($stored) && isset($stored['status']) && $stored['status'] === 'valid') {
         $modeOverride = array(
-            'formula'        => $stored['formula'],
-            'margin_enabled' => $stored['margin_enabled'],
-            'margin'         => $stored['margin'],
+            'formula'              => $stored['formula'],
+            'compound_rate_source' => $stored['compound_rate_source'],
+            'compound_custom_rate' => $stored['compound_custom_rate'],
+            'margin_enabled'       => $stored['margin_enabled'],
+            'margin'               => $stored['margin'],
         );
     }
 

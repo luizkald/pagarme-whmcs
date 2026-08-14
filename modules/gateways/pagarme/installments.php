@@ -536,26 +536,33 @@ function pagarme_compoundTotal($baseAmount, $monthlyRatePercent, $installments)
 }
 
 /**
- * Carrega a configuração de modo de cálculo (fórmula simples/composta +
- * margem fixa opcional), configurada pelo addon de admin
- * (modules/addons/pagarme_fee_rates/). Nunca fatal: defaults seguros
- * (simples, sem margem) se o arquivo não existir ou estiver corrompido -
- * idêntico ao comportamento anterior a esta funcionalidade.
+ * Carrega a configuração de modo de cálculo (fórmula simples/composta,
+ * fonte da taxa composta, margem fixa opcional), configurada pelo addon de
+ * admin (modules/addons/pagarme_fee_rates/). Nunca fatal: defaults seguros
+ * (simples, taxa composta = MDR, sem margem) se o arquivo não existir ou
+ * estiver corrompido - idêntico ao comportamento anterior a esta
+ * funcionalidade.
  *
- * @return array{formula: string, margin_enabled: bool, margin: array<string,float>}
+ * @return array{formula: string, compound_rate_source: string, compound_custom_rate: float, margin_enabled: bool, margin: array<string,float>}
  */
 function pagarme_loadInstallmentMode()
 {
     $config = pagarme_loadTable('pagarme_installment_mode.json');
 
     $formula = (isset($config['formula']) && $config['formula'] === 'compound') ? 'compound' : 'simple';
+    $compoundRateSource = (isset($config['compound_rate_source']) && $config['compound_rate_source'] === 'custom')
+        ? 'custom'
+        : 'mdr';
+    $compoundCustomRate = isset($config['compound_custom_rate']) ? (float) $config['compound_custom_rate'] : 0.0;
     $marginEnabled = !empty($config['margin_enabled']);
     $margin = (isset($config['margin']) && is_array($config['margin'])) ? $config['margin'] : array();
 
     return array(
-        'formula'        => $formula,
-        'margin_enabled' => $marginEnabled,
-        'margin'         => $margin,
+        'formula'              => $formula,
+        'compound_rate_source' => $compoundRateSource,
+        'compound_custom_rate' => $compoundCustomRate,
+        'margin_enabled'       => $marginEnabled,
+        'margin'               => $margin,
     );
 }
 
@@ -569,6 +576,19 @@ function pagarme_loadInstallmentMode()
  * pagarme_customerRate()+pagarme_feeForInstallments() por uma única chamada
  * que já devolve total/rate/fee_amount prontos.
  *
+ * No modo composto, a taxa usada para COMPOR pode vir da tabela MDR real
+ * (padrão, $mode['compound_rate_source'] === 'mdr', variando por bandeira e
+ * parcela como sempre) ou de uma taxa personalizada ÚNICA
+ * ($mode['compound_rate_source'] === 'custom', $mode['compound_custom_rate']
+ * - um só valor, o mesmo para qualquer bandeira e qualquer número de
+ * parcelas, decisão de negócio confirmada em 14/08/2026). Em QUALQUER dos
+ * dois casos, $rate (a taxa MDR real, via pagarme_customerRate()) continua
+ * sendo o que decide SE a parcela tem juros (faixa sem juros do ciclo,
+ * promoção ativa) - a taxa personalizada nunca decide isso, só QUANTO compor
+ * depois que já foi decidido que há juros. Uma taxa personalizada
+ * zerada/ausente não é erro: pagarme_compoundTotal() já trata taxa 0
+ * devolvendo a base sem juros.
+ *
  * $modeOverride permite à captura usar o modo PERSISTIDO no momento da
  * escolha do cliente (ver mod_pagarme_installments), em vez de reler a
  * configuração ao vivo - fecha a janela em que um admin muda o modo entre a
@@ -579,7 +599,7 @@ function pagarme_loadInstallmentMode()
  * @param string      $brand
  * @param int         $installments
  * @param int         $freeInstallments
- * @param array|null  $modeOverride  {formula, margin_enabled, margin} ou null
+ * @param array|null  $modeOverride  {formula, compound_rate_source, compound_custom_rate, margin_enabled, margin} ou null
  * @return array{total: float, rate: float, fee_amount: float}
  */
 function pagarme_installmentTotal($baseAmount, $brand, $installments, $freeInstallments, $modeOverride = null)
@@ -593,7 +613,11 @@ function pagarme_installmentTotal($baseAmount, $brand, $installments, $freeInsta
         $mode = is_array($modeOverride) ? $modeOverride : pagarme_loadInstallmentMode();
 
         if (isset($mode['formula']) && $mode['formula'] === 'compound') {
-            $total = pagarme_compoundTotal($base, $rate, $installments);
+            $compoundRate = $rate;
+            if (isset($mode['compound_rate_source']) && $mode['compound_rate_source'] === 'custom') {
+                $compoundRate = isset($mode['compound_custom_rate']) ? (float) $mode['compound_custom_rate'] : 0.0;
+            }
+            $total = pagarme_compoundTotal($base, $compoundRate, $installments);
         } else {
             $total = round($base + pagarme_feeForInstallments($base, $brand, $installments, $freeInstallments), 2);
         }
@@ -779,6 +803,8 @@ function pagarme_ensureInstallmentsTable()
                 $table->string('formula', 10)->default('simple');
                 $table->boolean('margin_enabled')->default(0);
                 $table->text('margin_snapshot')->nullable();
+                $table->string('compound_rate_source', 10)->default('mdr');
+                $table->text('compound_rate_snapshot')->nullable();
             });
             return $checked = true;
         }
@@ -786,7 +812,10 @@ function pagarme_ensureInstallmentsTable()
         // Tabela já existe (instalação anterior a esta funcionalidade) -
         // adiciona as colunas novas via migração idempotente, uma a uma.
         // Seguro rodar em toda request: hasColumn() confere antes de alterar.
-        $newColumns = array('formula', 'margin_enabled', 'margin_snapshot');
+        $newColumns = array(
+            'formula', 'margin_enabled', 'margin_snapshot',
+            'compound_rate_source', 'compound_rate_snapshot',
+        );
         $missing = array_filter($newColumns, function ($col) use ($schema) {
             return !$schema->hasColumn('mod_pagarme_installments', $col);
         });
@@ -802,6 +831,12 @@ function pagarme_ensureInstallmentsTable()
                 if (in_array('margin_snapshot', $missing, true)) {
                     $table->text('margin_snapshot')->nullable();
                 }
+                if (in_array('compound_rate_source', $missing, true)) {
+                    $table->string('compound_rate_source', 10)->default('mdr');
+                }
+                if (in_array('compound_rate_snapshot', $missing, true)) {
+                    $table->text('compound_rate_snapshot')->nullable();
+                }
             });
         }
 
@@ -813,17 +848,20 @@ function pagarme_ensureInstallmentsTable()
 
 /**
  * Grava a parcela escolhida para uma fatura, junto do modo de cálculo que
- * estava ao vivo no momento da escolha (fórmula + margem, com um retrato da
- * tabela de margem - não só a flag). Sem isso, se o admin trocar o modo ou
- * editar a margem entre a escolha do cliente e a captura, o valor cobrado
- * divergiria do que foi exibido - mesmo princípio que já protege base_amount.
+ * estava ao vivo no momento da escolha (fórmula + margem + fonte/valor da
+ * taxa composta personalizada). Sem isso, se o admin trocar o modo, editar a
+ * margem ou editar a taxa personalizada entre a escolha do cliente e a
+ * captura, o valor cobrado divergiria do que foi exibido - mesmo princípio
+ * que já protege base_amount.
  *
  * @param int    $invoiceId
  * @param int    $installments
- * @param float  $baseAmount      Base usada no cálculo, para detectar fatura alterada
- * @param string $formula         'simple'|'compound', modo ao vivo no momento da escolha
- * @param bool   $marginEnabled   Se a margem estava ativa no momento da escolha
- * @param array  $marginSnapshot  Tabela de margem (parcela => %) no momento da escolha
+ * @param float  $baseAmount            Base usada no cálculo, para detectar fatura alterada
+ * @param string $formula               'simple'|'compound', modo ao vivo no momento da escolha
+ * @param bool   $marginEnabled         Se a margem estava ativa no momento da escolha
+ * @param array  $marginSnapshot        Tabela de margem (parcela => %) no momento da escolha
+ * @param string $compoundRateSource    'mdr'|'custom', fonte da taxa composta no momento da escolha
+ * @param float  $compoundRateSnapshot  Taxa personalizada ÚNICA (mesma para toda parcela/bandeira) no momento da escolha
  * @param int    $ttlSeconds
  * @return bool
  */
@@ -834,6 +872,8 @@ function pagarme_storeSelectedInstallments(
     $formula = 'simple',
     $marginEnabled = false,
     $marginSnapshot = array(),
+    $compoundRateSource = 'mdr',
+    $compoundRateSnapshot = 0.0,
     $ttlSeconds = 1800
 ) {
     if (!pagarme_ensureInstallmentsTable()) {
@@ -841,12 +881,14 @@ function pagarme_storeSelectedInstallments(
     }
 
     $row = array(
-        'installments'    => (int) $installments,
-        'base_amount'     => number_format((float) $baseAmount, 2, '.', ''),
-        'expires_at'      => date('Y-m-d H:i:s', time() + (int) $ttlSeconds),
-        'formula'         => ($formula === 'compound') ? 'compound' : 'simple',
-        'margin_enabled'  => $marginEnabled ? 1 : 0,
-        'margin_snapshot' => !empty($marginSnapshot) ? json_encode($marginSnapshot) : null,
+        'installments'            => (int) $installments,
+        'base_amount'             => number_format((float) $baseAmount, 2, '.', ''),
+        'expires_at'              => date('Y-m-d H:i:s', time() + (int) $ttlSeconds),
+        'formula'                 => ($formula === 'compound') ? 'compound' : 'simple',
+        'margin_enabled'          => $marginEnabled ? 1 : 0,
+        'margin_snapshot'         => !empty($marginSnapshot) ? json_encode($marginSnapshot) : null,
+        'compound_rate_source'    => ($compoundRateSource === 'custom') ? 'custom' : 'mdr',
+        'compound_rate_snapshot'  => ((float) $compoundRateSnapshot > 0) ? number_format((float) $compoundRateSnapshot, 4, '.', '') : null,
     );
 
     try {
@@ -882,11 +924,13 @@ function pagarme_storeSelectedInstallments(
 function pagarme_readStoredInstallments($invoiceId)
 {
     $empty = array(
-        'installments'   => null,
-        'base_amount'    => null,
-        'formula'        => 'simple',
-        'margin_enabled' => false,
-        'margin'         => array(),
+        'installments'         => null,
+        'base_amount'          => null,
+        'formula'              => 'simple',
+        'margin_enabled'       => false,
+        'margin'               => array(),
+        'compound_rate_source' => 'mdr',
+        'compound_custom_rate' => 0.0,
     );
 
     if (!pagarme_ensureInstallmentsTable()) {
@@ -913,12 +957,16 @@ function pagarme_readStoredInstallments($invoiceId)
         }
     }
 
+    $compoundRateSnapshot = !empty($row->compound_rate_snapshot) ? (float) $row->compound_rate_snapshot : 0.0;
+
     $found = array(
-        'installments'   => (int) $row->installments,
-        'base_amount'    => (float) $row->base_amount,
-        'formula'        => (isset($row->formula) && $row->formula === 'compound') ? 'compound' : 'simple',
-        'margin_enabled' => !empty($row->margin_enabled),
-        'margin'         => $marginSnapshot,
+        'installments'         => (int) $row->installments,
+        'base_amount'          => (float) $row->base_amount,
+        'formula'              => (isset($row->formula) && $row->formula === 'compound') ? 'compound' : 'simple',
+        'margin_enabled'       => !empty($row->margin_enabled),
+        'margin'               => $marginSnapshot,
+        'compound_rate_source' => (isset($row->compound_rate_source) && $row->compound_rate_source === 'custom') ? 'custom' : 'mdr',
+        'compound_custom_rate' => $compoundRateSnapshot,
     );
 
     if (strtotime($row->expires_at) < time()) {

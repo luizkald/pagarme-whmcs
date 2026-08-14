@@ -529,12 +529,20 @@ function pagarme_fee_rates_logPromotionChange($before, $after)
 }
 
 /**
- * Valida o POST do modo de cálculo (fórmula simples/composta + margem fixa
- * opcional) e monta o array pronto para serialização.
+ * Valida o POST do modo de cálculo (fórmula simples/composta, fonte da taxa
+ * composta, margem fixa opcional) e monta o array pronto para serialização.
  *
- * Diferente da grade de taxas: a margem NÃO tem piso/mínimo (é markup
- * discricionário da loja, sem custo real de gateway a proteger) - só a faixa
- * 0-20 já usada na grade principal.
+ * Diferente da grade de taxas MDR: nem a margem nem a taxa personalizada da
+ * composta têm piso/mínimo (são parâmetros discricionários da loja, sem
+ * custo real de gateway a proteger) - só a faixa 0-20 já usada na grade
+ * principal. Confirmado explicitamente com o usuário: a taxa personalizada
+ * pode ser menor que a MDR real sem quebrar a trava de mínimo, porque a
+ * decisão de negócio é dela mesma servir como um valor livre.
+ *
+ * A taxa personalizada é um valor ÚNICO (não uma grade por parcela): decisão
+ * confirmada com o usuário em 14/08/2026 - o mesmo percentual vale para
+ * qualquer bandeira e qualquer número de parcelas, ao contrário da margem
+ * (que continua sendo uma grade de 12 células).
  *
  * @param mixed $postedMode $_POST['mode'] bruto
  * @return array{success: bool, data: array|null, errors: string[]}
@@ -548,6 +556,9 @@ function pagarme_fee_rates_validateMode($postedMode)
     }
 
     $formula = (isset($postedMode['formula']) && $postedMode['formula'] === 'compound') ? 'compound' : 'simple';
+    $compoundRateSource = (isset($postedMode['compound_rate_source']) && $postedMode['compound_rate_source'] === 'custom')
+        ? 'custom'
+        : 'mdr';
     $marginEnabled = !empty($postedMode['margin_enabled']);
 
     $margin = array();
@@ -571,6 +582,20 @@ function pagarme_fee_rates_validateMode($postedMode)
         $margin[$key] = round($value, 2);
     }
 
+    $compoundCustomRate = 0.0;
+    $rawCustomRate = isset($postedMode['compound_custom_rate']) ? trim((string) $postedMode['compound_custom_rate']) : '0';
+
+    if ($rawCustomRate === '' || !is_numeric($rawCustomRate)) {
+        $errors[] = 'Valor inválido em Taxa personalizada: informe um número.';
+    } else {
+        $customValue = (float) $rawCustomRate;
+        if ($customValue < 0 || $customValue > 20) {
+            $errors[] = 'Valor fora da faixa em Taxa personalizada: deve estar entre 0 e 20.';
+        } else {
+            $compoundCustomRate = round($customValue, 4);
+        }
+    }
+
     if (!empty($errors)) {
         return array('success' => false, 'data' => null, 'errors' => $errors);
     }
@@ -578,9 +603,11 @@ function pagarme_fee_rates_validateMode($postedMode)
     return array(
         'success' => true,
         'data'    => array(
-            'formula'        => $formula,
-            'margin_enabled' => $marginEnabled,
-            'margin'         => $margin,
+            'formula'              => $formula,
+            'compound_rate_source' => $compoundRateSource,
+            'compound_custom_rate' => $compoundCustomRate,
+            'margin_enabled'       => $marginEnabled,
+            'margin'               => $margin,
         ),
         'errors' => array(),
     );
@@ -608,6 +635,19 @@ function pagarme_fee_rates_logModeChange($before, $after)
         if ($oldFormula !== $newFormula) {
             $label = array('simple' => 'Simples', 'compound' => 'Composta (Tabela Price)');
             $changes[] = "Fórmula: {$label[$oldFormula]} -> {$label[$newFormula]}";
+        }
+
+        $oldRateSource = isset($before['compound_rate_source']) && $before['compound_rate_source'] === 'custom' ? 'custom' : 'mdr';
+        $newRateSource = isset($after['compound_rate_source']) && $after['compound_rate_source'] === 'custom' ? 'custom' : 'mdr';
+        if ($oldRateSource !== $newRateSource) {
+            $sourceLabel = array('mdr' => 'Taxa MDR da tabela', 'custom' => 'Taxa personalizada única');
+            $changes[] = "Fonte da taxa composta: {$sourceLabel[$oldRateSource]} -> {$sourceLabel[$newRateSource]}";
+        }
+
+        $oldCustomRate = round((float) (isset($before['compound_custom_rate']) ? $before['compound_custom_rate'] : 0), 4);
+        $newCustomRate = round((float) (isset($after['compound_custom_rate']) ? $after['compound_custom_rate'] : 0), 4);
+        if ($oldCustomRate !== $newCustomRate) {
+            $changes[] = "Taxa personalizada: {$oldCustomRate}% -> {$newCustomRate}%";
         }
 
         $oldMarginEnabled = !empty($before['margin_enabled']);
@@ -779,17 +819,28 @@ function pagarme_fee_rates_parseAmount($raw)
  * $installments) em pagarme.php - usa a taxa da faixa real desde a reversão
  * de 14/08/2026), replicada aqui pela mesma nota de isolamento acima.
  *
- * @param mixed  $amount        Valor a simular, texto livre (BR ou US) - ver pagarme_fee_rates_parseAmount()
- * @param string $brand         Bandeira (uma das PAGARME_FEE_RATES_BRANDS)
- * @param string $cycleKey      Chave de pagarme_fee_rates_cycles()
- * @param string $formula       'simple'|'compound'
+ * @param mixed  $amount              Valor a simular, texto livre (BR ou US) - ver pagarme_fee_rates_parseAmount()
+ * @param string $brand               Bandeira (uma das PAGARME_FEE_RATES_BRANDS)
+ * @param string $cycleKey            Chave de pagarme_fee_rates_cycles()
+ * @param string $formula             'simple'|'compound'
+ * @param string $compoundRateSource  'mdr'|'custom' - só relevante quando $formula === 'compound'
+ * @param float  $compoundCustomRate  Taxa mensal composta personalizada ÚNICA (mesma para qualquer bandeira/parcela)
  * @param bool   $marginEnabled
- * @param array  $marginTable   parcela => %
- * @param array  $taxesTable    Tabela de taxas MDR já carregada (pagarme_credit_card_taxes.json)
+ * @param array  $marginTable         parcela => %
+ * @param array  $taxesTable          Tabela de taxas MDR já carregada (pagarme_credit_card_taxes.json)
  * @return array{success: bool, errors: string[], rows: array, cycleLabel: string, maxInstallments: int, freeInstallments: int}
  */
-function pagarme_fee_rates_simulate($amount, $brand, $cycleKey, $formula, $marginEnabled, $marginTable, $taxesTable)
-{
+function pagarme_fee_rates_simulate(
+    $amount,
+    $brand,
+    $cycleKey,
+    $formula,
+    $compoundRateSource,
+    $compoundCustomRate,
+    $marginEnabled,
+    $marginTable,
+    $taxesTable
+) {
     $errors = array();
 
     $amount = pagarme_fee_rates_parseAmount($amount);
@@ -843,10 +894,21 @@ function pagarme_fee_rates_simulate($amount, $brand, $cycleKey, $formula, $margi
         } elseif ($formula === 'compound') {
             // Mesma fórmula de pagarme_compoundTotal() (Tabela Price), replicada
             // aqui deliberadamente - ver nota de isolamento no docblock acima.
-            $i = $customerRate / 100;
-            $factor = pow(1 + $i, $n);
-            $total = ($factor > 1) ? round($amount * ($i * $factor) / ($factor - 1) * $n, 2) : $amount;
-            $total = max($total, $amount);
+            // A taxa usada para COMPOR pode vir da tabela MDR real ($customerRate,
+            // padrão) ou de uma taxa personalizada ÚNICA (mesmo valor para
+            // qualquer bandeira/parcela) - mas SE há juros continua decidido só
+            // por $customerRate acima, nunca pela personalizada (mesma regra do
+            // core, ver pagarme_installmentTotal()).
+            $compoundRate = ($compoundRateSource === 'custom') ? (float) $compoundCustomRate : $customerRate;
+
+            if ($compoundRate <= 0) {
+                $total = $amount;
+            } else {
+                $i = $compoundRate / 100;
+                $factor = pow(1 + $i, $n);
+                $total = ($factor > 1) ? round($amount * ($i * $factor) / ($factor - 1) * $n, 2) : $amount;
+                $total = max($total, $amount);
+            }
         } else {
             $total = round($amount + $amount * ($customerRate / 100), 2);
         }
@@ -990,7 +1052,7 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
         }
         .pfr-floor-hint { font-size: 10px; color: #999; white-space: nowrap; }
         .pfr-actions { margin-top: 14px; }
-        .pfr-hint { color: #666; font-size: 12px; margin-top: 6px; }
+        .pfr-hint { color: #666; font-size: 12px; margin-top: 6px; max-width: 720px; line-height: 1.5; }
         .pfr-promo-table { border-collapse: collapse; margin-top: 10px; width: 100%; max-width: 720px; }
         .pfr-promo-table th, .pfr-promo-table td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; }
         .pfr-promo-table th { background: #f5f5f5; font-weight: 600; }
@@ -1075,7 +1137,7 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
     </style>
     <div class="pfr-wrap">
         <h3>Taxas MDR - Pagar.me</h3>
-        <p>Percentual de taxa cobrado por bandeira e número de parcelas. Valores entre 0 e 20, nunca abaixo do mínimo (custo real do gateway).</p>
+        <p class="pfr-hint" style="font-size:13px;color:#444;">Percentual de taxa cobrado por bandeira e número de parcelas. Valores entre 0 e 20, nunca abaixo do mínimo (custo real do gateway).</p>
 
         <?php if ($justSaved): ?>
             <div class="alert alert-success">Taxas atualizadas com sucesso.</div>
@@ -1251,7 +1313,7 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
                     Simples (juros aplicado uma única vez sobre o valor da fatura)
                 </label>
                 <label style="display:block;margin-top:6px;">
-                    <input type="radio" name="mode[formula]" value="compound"
+                    <input type="radio" name="mode[formula]" value="compound" id="pfr-formula-compound"
                         <?php echo (!empty($mode['formula']) && $mode['formula'] === 'compound') ? 'checked' : ''; ?>>
                     Composta — Tabela Price (juros compostos por parcela, mesmo modelo de financiamento bancário)
                 </label>
@@ -1262,6 +1324,45 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
                 o cliente em parcelamentos longos (o juros incide sobre o juros acumulado a cada
                 parcela, não só sobre o valor original). Confirme com o financeiro antes de ativar
                 em produção.
+            </div>
+
+            <div id="pfr-compound-rate-source-wrap" style="display:none;margin-top:12px;padding-left:22px;">
+                <p class="pfr-hint" style="margin-top:0;">
+                    Taxa usada para compor os juros do modo Composto (não decide se a parcela TEM
+                    juros — isso continua vindo do teto do ciclo e das promoções ativas na aba
+                    "Promoção sem juros"; só decide o percentual usado a partir daí).
+                </p>
+                <label style="display:block;">
+                    <input type="radio" name="mode[compound_rate_source]" value="mdr"
+                        <?php echo (empty($mode['compound_rate_source']) || $mode['compound_rate_source'] !== 'custom') ? 'checked' : ''; ?>>
+                    Usar taxa MDR da tabela (aba "Taxas", padrão)
+                </label>
+                <label style="display:block;margin-top:4px;">
+                    <input type="radio" name="mode[compound_rate_source]" value="custom" id="pfr-rate-source-custom"
+                        <?php echo (!empty($mode['compound_rate_source']) && $mode['compound_rate_source'] === 'custom') ? 'checked' : ''; ?>>
+                    Usar taxa personalizada (abaixo)
+                </label>
+
+                <div id="pfr-custom-rate-table-wrap" style="display:none;margin-top:10px;">
+                    <span class="pfr-percent-wrap">
+                        <input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            max="20"
+                            name="mode[compound_custom_rate]"
+                            value="<?php echo pagarme_fee_rates_h(isset($mode['compound_custom_rate']) ? $mode['compound_custom_rate'] : 0); ?>"
+                        >
+                        <span class="pfr-percent-sign" aria-hidden="true">%</span>
+                    </span>
+                    <p class="pfr-hint">
+                        Um único valor, usado como taxa mensal composta para QUALQUER bandeira e
+                        QUALQUER número de parcelas — não varia por parcela como a grade de taxas
+                        MDR ou a margem fixa. Sem piso/mínimo — este valor é livre (pode ser menor
+                        que o custo real do gateway sem risco, já que a diferença não é repassada
+                        como prejuízo à loja).
+                    </p>
+                </div>
             </div>
 
             <div class="pfr-mode-example">
@@ -1384,10 +1485,38 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
                     Simples
                 </label>
                 <label style="display:block;margin-top:4px;">
-                    <input type="radio" name="sim[formula]" value="compound"
+                    <input type="radio" name="sim[formula]" value="compound" id="pfr-sim-formula-compound"
                         <?php echo (isset($simInput['formula']) && $simInput['formula'] === 'compound') ? 'checked' : ''; ?>>
                     Composta (Tabela Price)
                 </label>
+            </div>
+
+            <div id="pfr-sim-compound-rate-source-wrap" style="display:none;margin-top:10px;padding-left:22px;">
+                <label style="display:block;">
+                    <input type="radio" name="sim[compound_rate_source]" value="mdr"
+                        <?php echo (empty($simInput['compound_rate_source']) || $simInput['compound_rate_source'] !== 'custom') ? 'checked' : ''; ?>>
+                    Usar taxa MDR da tabela
+                </label>
+                <label style="display:block;margin-top:4px;">
+                    <input type="radio" name="sim[compound_rate_source]" value="custom" id="pfr-sim-rate-source-custom"
+                        <?php echo (!empty($simInput['compound_rate_source']) && $simInput['compound_rate_source'] === 'custom') ? 'checked' : ''; ?>>
+                    Usar taxa personalizada
+                </label>
+
+                <div id="pfr-sim-custom-rate-table-wrap" style="display:none;margin-top:10px;">
+                    <span class="pfr-percent-wrap">
+                        <input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            max="20"
+                            name="sim[compound_custom_rate]"
+                            value="<?php echo pagarme_fee_rates_h(isset($simInput['compound_custom_rate']) ? $simInput['compound_custom_rate'] : 0); ?>"
+                        >
+                        <span class="pfr-percent-sign" aria-hidden="true">%</span>
+                    </span>
+                    <p class="pfr-hint">Um único valor, usado para qualquer bandeira e parcela simulada.</p>
+                </div>
             </div>
 
             <p class="pfr-hint" style="margin-top:14px;">
@@ -1541,6 +1670,31 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
             syncSimMarginVisibility();
         }
 
+        // --- Mesma hierarquia de fonte de taxa, para o Simulador -----------
+        var simFormulaRadios = document.querySelectorAll('input[name="sim[formula]"]');
+        var simRateSourceWrap = document.getElementById('pfr-sim-compound-rate-source-wrap');
+        var simRateSourceRadios = document.querySelectorAll('input[name="sim[compound_rate_source]"]');
+        var simCustomRateTableWrap = document.getElementById('pfr-sim-custom-rate-table-wrap');
+        function syncSimCompoundRateSourceVisibility() {
+            var formulaSelected = document.querySelector('input[name="sim[formula]"]:checked');
+            var isCompound = formulaSelected && formulaSelected.value === 'compound';
+            if (simRateSourceWrap) {
+                simRateSourceWrap.style.display = isCompound ? 'block' : 'none';
+            }
+            var sourceSelected = document.querySelector('input[name="sim[compound_rate_source]"]:checked');
+            var isCustom = isCompound && sourceSelected && sourceSelected.value === 'custom';
+            if (simCustomRateTableWrap) {
+                simCustomRateTableWrap.style.display = isCustom ? 'block' : 'none';
+            }
+        }
+        for (var r = 0; r < simFormulaRadios.length; r++) {
+            simFormulaRadios[r].addEventListener('change', syncSimCompoundRateSourceVisibility);
+        }
+        for (var s = 0; s < simRateSourceRadios.length; s++) {
+            simRateSourceRadios[s].addEventListener('change', syncSimCompoundRateSourceVisibility);
+        }
+        syncSimCompoundRateSourceVisibility();
+
         // --- Aviso permanente quando "Composta" está selecionada ----------
         var formulaRadios = document.querySelectorAll('input[name="mode[formula]"]');
         var compoundWarning = document.getElementById('pfr-mode-compound-warning');
@@ -1554,6 +1708,32 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
             formulaRadios[m].addEventListener('change', syncCompoundWarning);
         }
         syncCompoundWarning();
+
+        // --- Sub-opção de fonte da taxa: só aparece com "Composta" ativa,
+        // e a grade personalizada só aparece com "Taxa personalizada" ativa
+        // dentro dela (hierarquia de 2 níveis).
+        var rateSourceWrap = document.getElementById('pfr-compound-rate-source-wrap');
+        var rateSourceRadios = document.querySelectorAll('input[name="mode[compound_rate_source]"]');
+        var customRateTableWrap = document.getElementById('pfr-custom-rate-table-wrap');
+        function syncCompoundRateSourceVisibility() {
+            var formulaSelected = document.querySelector('input[name="mode[formula]"]:checked');
+            var isCompound = formulaSelected && formulaSelected.value === 'compound';
+            if (rateSourceWrap) {
+                rateSourceWrap.style.display = isCompound ? 'block' : 'none';
+            }
+            var sourceSelected = document.querySelector('input[name="mode[compound_rate_source]"]:checked');
+            var isCustom = isCompound && sourceSelected && sourceSelected.value === 'custom';
+            if (customRateTableWrap) {
+                customRateTableWrap.style.display = isCustom ? 'block' : 'none';
+            }
+        }
+        for (var p = 0; p < formulaRadios.length; p++) {
+            formulaRadios[p].addEventListener('change', syncCompoundRateSourceVisibility);
+        }
+        for (var q = 0; q < rateSourceRadios.length; q++) {
+            rateSourceRadios[q].addEventListener('change', syncCompoundRateSourceVisibility);
+        }
+        syncCompoundRateSourceVisibility();
 
         // --- Confirmação antes de salvar -----------------------------------
         // Ativar uma promoção zera juros para TODAS as parcelas da bandeira,
@@ -1628,13 +1808,17 @@ function pagarme_fee_rates_readSimInput($postedSim)
         $margin[$key] = array_key_exists($key, $postedMargin) ? $postedMargin[$key] : 0;
     }
 
+    $compoundCustomRate = isset($postedSim['compound_custom_rate']) ? $postedSim['compound_custom_rate'] : 0;
+
     return array(
-        'amount'         => isset($postedSim['amount']) ? $postedSim['amount'] : '',
-        'brand'          => isset($postedSim['brand']) ? (string) $postedSim['brand'] : 'outras',
-        'cycle'          => isset($postedSim['cycle']) ? (string) $postedSim['cycle'] : 'annually',
-        'formula'        => (isset($postedSim['formula']) && $postedSim['formula'] === 'compound') ? 'compound' : 'simple',
-        'margin_enabled' => !empty($postedSim['margin_enabled']),
-        'margin'         => $margin,
+        'amount'               => isset($postedSim['amount']) ? $postedSim['amount'] : '',
+        'brand'                => isset($postedSim['brand']) ? (string) $postedSim['brand'] : 'outras',
+        'cycle'                => isset($postedSim['cycle']) ? (string) $postedSim['cycle'] : 'annually',
+        'formula'              => (isset($postedSim['formula']) && $postedSim['formula'] === 'compound') ? 'compound' : 'simple',
+        'compound_rate_source' => (isset($postedSim['compound_rate_source']) && $postedSim['compound_rate_source'] === 'custom') ? 'custom' : 'mdr',
+        'compound_custom_rate' => $compoundCustomRate,
+        'margin_enabled'       => !empty($postedSim['margin_enabled']),
+        'margin'               => $margin,
     );
 }
 
@@ -1708,6 +1892,8 @@ function pagarme_fee_rates_output($vars)
             $simInput['brand'],
             $simInput['cycle'],
             $simInput['formula'],
+            $simInput['compound_rate_source'],
+            $simInput['compound_custom_rate'],
             $simInput['margin_enabled'],
             $simInput['margin'],
             $currentTaxes

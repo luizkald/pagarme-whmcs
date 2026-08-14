@@ -122,7 +122,10 @@ try {
     // ativo depois - ver pagarme_installmentTotal()/pagarme_capture().
     $modeSnapshot = function_exists('pagarme_loadInstallmentMode')
         ? pagarme_loadInstallmentMode()
-        : array('formula' => 'simple', 'margin_enabled' => false, 'margin' => array());
+        : array(
+            'formula' => 'simple', 'margin_enabled' => false, 'margin' => array(),
+            'compound_rate_source' => 'mdr', 'compound_custom_rate' => 0.0,
+        );
 
     $stored = pagarme_storeSelectedInstallments(
         $invoiceId,
@@ -130,7 +133,9 @@ try {
         $data['base_amount'],
         $modeSnapshot['formula'],
         $modeSnapshot['margin_enabled'],
-        $modeSnapshot['margin']
+        $modeSnapshot['margin'],
+        $modeSnapshot['compound_rate_source'],
+        $modeSnapshot['compound_custom_rate']
     );
 
     if (!$stored) {
