@@ -1134,6 +1134,51 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
         .pfr-sim-results th, .pfr-sim-results td { border: 1px solid #ddd; padding: 6px 10px; text-align: center; }
         .pfr-sim-results th { background: #f5f5f5; font-weight: 600; }
         .pfr-sim-results td.pfr-sim-free { color: #17803d; }
+        .pfr-tab-dirty-dot {
+            display: none;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #d97706;
+            margin-left: 6px;
+        }
+        .pfr-tab-btn.pfr-tab-dirty .pfr-tab-dirty-dot { display: inline-block; }
+        .pfr-dirty-warning {
+            display: none;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+            padding: 8px 12px;
+            border: 1px solid color-mix(in srgb, #d97706 40%, #ddd);
+            border-radius: 4px;
+            background: color-mix(in srgb, #d97706 8%, #fff);
+            font-size: 12px;
+            color: #7a4a06;
+            max-width: 720px;
+        }
+        .pfr-dirty-warning.pfr-dirty-visible { display: flex; }
+        .pfr-revert-btn {
+            border: 1px solid #ddd;
+            background: #fff;
+            color: #444;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .pfr-simulate-btn {
+            border: 1px solid #1d4ed8;
+            background: #2563eb;
+            color: #fff;
+            font-size: 14px;
+            font-weight: 700;
+            padding: 8px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .pfr-simulate-btn:hover { background: #1d4ed8; }
     </style>
     <div class="pfr-wrap">
         <h3>Taxas MDR - Pagar.me</h3>
@@ -1159,13 +1204,17 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
             <input type="hidden" name="active_tab" id="pfr-active-tab" value="<?php echo pagarme_fee_rates_h($activeTab); ?>">
 
             <div class="pfr-tabs">
-                <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'taxas' ? ' pfr-tab-active' : ''; ?>" data-tab="taxas">Taxas</button>
-                <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'promo' ? ' pfr-tab-active' : ''; ?>" data-tab="promo">Promoção sem juros</button>
-                <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'modo' ? ' pfr-tab-active' : ''; ?>" data-tab="modo">Modo de Cálculo</button>
+                <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'taxas' ? ' pfr-tab-active' : ''; ?>" data-tab="taxas">Taxas<span class="pfr-tab-dirty-dot" aria-hidden="true"></span></button>
+                <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'promo' ? ' pfr-tab-active' : ''; ?>" data-tab="promo">Promoção sem juros<span class="pfr-tab-dirty-dot" aria-hidden="true"></span></button>
+                <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'modo' ? ' pfr-tab-active' : ''; ?>" data-tab="modo">Modo de Cálculo<span class="pfr-tab-dirty-dot" aria-hidden="true"></span></button>
                 <button type="button" class="pfr-tab-btn<?php echo $activeTab === 'sim' ? ' pfr-tab-active' : ''; ?>" data-tab="sim">Simulador</button>
             </div>
 
             <div class="pfr-tab-panel<?php echo $activeTab === 'taxas' ? ' pfr-tab-active' : ''; ?>" data-tab="taxas">
+            <div class="pfr-dirty-warning" data-dirty-warning-for="taxas">
+                <span>Há alterações não salvas nesta aba.</span>
+                <button type="button" class="pfr-revert-btn" data-revert-for="taxas">Voltar para o Padrão</button>
+            </div>
             <table class="pfr-table">
                 <thead>
                     <tr>
@@ -1227,6 +1276,10 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
             </div>
 
             <div class="pfr-tab-panel<?php echo $activeTab === 'promo' ? ' pfr-tab-active' : ''; ?>" data-tab="promo">
+            <div class="pfr-dirty-warning" data-dirty-warning-for="promo">
+                <span>Há alterações não salvas nesta aba.</span>
+                <button type="button" class="pfr-revert-btn" data-revert-for="promo">Voltar para o Padrão</button>
+            </div>
             <h3 class="pfr-section-title">Promoções sem juros</h3>
             <p class="pfr-hint">
                 Enquanto ativa, TODAS as parcelas da bandeira ficam sem juros, mesmo acima do teto
@@ -1297,6 +1350,10 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
             </div>
 
             <div class="pfr-tab-panel<?php echo $activeTab === 'modo' ? ' pfr-tab-active' : ''; ?>" data-tab="modo">
+            <div class="pfr-dirty-warning" data-dirty-warning-for="modo">
+                <span>Há alterações não salvas nesta aba.</span>
+                <button type="button" class="pfr-revert-btn" data-revert-for="modo">Voltar para o Padrão</button>
+            </div>
             <h3 class="pfr-section-title">Modo de Cálculo</h3>
             <p class="pfr-hint">
                 Como o juros de parcelamento é calculado quando o cliente escolhe mais de 1x
@@ -1562,11 +1619,15 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
             </div>
 
             <div class="pfr-actions">
-                <button type="submit" name="pagarme_fee_rates_simulate" value="1" class="btn">
+                <button type="submit" name="pagarme_fee_rates_simulate" value="1" class="pfr-simulate-btn">
                     Simular
+                </button>
+                <button type="button" id="pfr-sim-clear" class="pfr-revert-btn">
+                    Limpar
                 </button>
             </div>
 
+            <div id="pfr-sim-results-wrap">
             <?php if ($simResult !== null && $simResult['success']): ?>
                 <table class="pfr-sim-results">
                     <thead>
@@ -1606,6 +1667,7 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
                     "Taxas da Transação" na fatura real.
                 </p>
             <?php endif; ?>
+            </div>
             </div>
         </form>
     </div>
@@ -1734,6 +1796,141 @@ function pagarme_fee_rates_renderForm($values, $floorGrid, $promotions, $mode, $
             rateSourceRadios[q].addEventListener('change', syncCompoundRateSourceVisibility);
         }
         syncCompoundRateSourceVisibility();
+
+        // --- Aviso de alteração não salva + "Voltar para o Padrão", por aba -
+        // Cada painel de gravação (Taxas, Promoção, Modo de Cálculo) tem seu
+        // próprio snapshot e seu próprio aviso/botão - nunca um estado global.
+        // O snapshot é capturado agora, na carga da página, e É o valor
+        // gravado em disco (foi o PHP que preencheu esses campos a partir do
+        // arquivo) - por isso reverter nunca precisa de chamada ao servidor.
+        var dirtyTabKeys = ['taxas', 'promo', 'modo'];
+        var dirtySyncFns = {
+            taxas: [],
+            promo: [],
+            modo: [syncCompoundWarning, syncCompoundRateSourceVisibility, syncMarginVisibility]
+        };
+
+        function captureDirtySnapshot(panel) {
+            var snapshot = [];
+            var fields = panel.querySelectorAll('input, select, textarea');
+            for (var f = 0; f < fields.length; f++) {
+                var field = fields[f];
+                var type = (field.type || '').toLowerCase();
+                snapshot.push({
+                    el: field,
+                    value: (type === 'checkbox' || type === 'radio') ? null : field.value,
+                    checked: (type === 'checkbox' || type === 'radio') ? field.checked : null
+                });
+            }
+            return snapshot;
+        }
+
+        function isDirtySnapshot(snapshot) {
+            for (var i2 = 0; i2 < snapshot.length; i2++) {
+                var entry = snapshot[i2];
+                var type = (entry.el.type || '').toLowerCase();
+                if (type === 'checkbox' || type === 'radio') {
+                    if (entry.el.checked !== entry.checked) return true;
+                } else if (entry.el.value !== entry.value) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        function restoreDirtySnapshot(snapshot) {
+            for (var i3 = 0; i3 < snapshot.length; i3++) {
+                var entry = snapshot[i3];
+                var type = (entry.el.type || '').toLowerCase();
+                if (type === 'checkbox' || type === 'radio') {
+                    entry.el.checked = entry.checked;
+                } else {
+                    entry.el.value = entry.value;
+                }
+            }
+        }
+
+        for (var d = 0; d < dirtyTabKeys.length; d++) {
+            (function (tabKey) {
+                var panel = document.querySelector('.pfr-tab-panel[data-tab="' + tabKey + '"]');
+                if (!panel) return;
+                var warning = document.querySelector('[data-dirty-warning-for="' + tabKey + '"]');
+                var revertBtn = document.querySelector('[data-revert-for="' + tabKey + '"]');
+                var tabBtn = document.querySelector('.pfr-tab-btn[data-tab="' + tabKey + '"]');
+                var snapshot = captureDirtySnapshot(panel);
+
+                function refreshDirtyState() {
+                    var dirty = isDirtySnapshot(snapshot);
+                    if (warning) {
+                        warning.classList.toggle('pfr-dirty-visible', dirty);
+                    }
+                    if (tabBtn) {
+                        tabBtn.classList.toggle('pfr-tab-dirty', dirty);
+                    }
+                }
+
+                panel.addEventListener('input', refreshDirtyState);
+                panel.addEventListener('change', refreshDirtyState);
+
+                if (revertBtn) {
+                    revertBtn.addEventListener('click', function () {
+                        restoreDirtySnapshot(snapshot);
+                        var fns = dirtySyncFns[tabKey] || [];
+                        for (var g = 0; g < fns.length; g++) {
+                            fns[g]();
+                        }
+                        refreshDirtyState();
+                    });
+                }
+
+                refreshDirtyState();
+            })(dirtyTabKeys[d]);
+        }
+
+        // --- Limpar simulação -----------------------------------------------
+        // Puramente client-side: reseta os campos do painel "sim" para o
+        // estado vazio/padrão e esconde a tabela de resultado (se uma
+        // simulação anterior a deixou visível), sem nenhum POST.
+        var simClearBtn = document.getElementById('pfr-sim-clear');
+        if (simClearBtn) {
+            simClearBtn.addEventListener('click', function () {
+                var simPanel = document.querySelector('.pfr-tab-panel[data-tab="sim"]');
+                if (simPanel) {
+                    var amountField = simPanel.querySelector('input[name="sim[amount]"]');
+                    if (amountField) amountField.value = '';
+
+                    var brandField = simPanel.querySelector('select[name="sim[brand]"]');
+                    if (brandField) brandField.value = 'outras';
+
+                    var cycleField = simPanel.querySelector('select[name="sim[cycle]"]');
+                    if (cycleField) cycleField.value = 'annually';
+
+                    var simpleFormula = simPanel.querySelector('input[name="sim[formula]"][value="simple"]');
+                    if (simpleFormula) simpleFormula.checked = true;
+
+                    if (simMarginCheckbox) simMarginCheckbox.checked = false;
+
+                    var mdrSource = simPanel.querySelector('input[name="sim[compound_rate_source]"][value="mdr"]');
+                    if (mdrSource) mdrSource.checked = true;
+
+                    var customRateField = simPanel.querySelector('input[name="sim[compound_custom_rate]"]');
+                    if (customRateField) customRateField.value = '';
+
+                    var marginInputs = simPanel.querySelectorAll('input[name^="sim[margin]"]');
+                    for (var mi = 0; mi < marginInputs.length; mi++) {
+                        marginInputs[mi].value = '0';
+                    }
+                }
+
+                syncSimMarginVisibility();
+                syncSimCompoundRateSourceVisibility();
+
+                var resultsWrap = document.getElementById('pfr-sim-results-wrap');
+                if (resultsWrap) {
+                    resultsWrap.style.display = 'none';
+                }
+            });
+        }
 
         // --- Confirmação antes de salvar -----------------------------------
         // Ativar uma promoção zera juros para TODAS as parcelas da bandeira,
