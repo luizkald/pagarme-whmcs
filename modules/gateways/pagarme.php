@@ -100,8 +100,11 @@ function pagarme_config()
  * Processa a cobrança de uma fatura.
  *
  * Dois cenários são tratados:
- *   1. $params['gatewayid'] preenchido -> cobra um cartão já tokenizado
- *      (usado pelo cron de cobrança automática / recorrência)
+ *   1. $params['gatewayid'] preenchido -> cobra um cartão já tokenizado.
+ *      Usado tanto pelo cron de cobrança automática / recorrência quanto por
+ *      um cliente pagando fatura de pedido novo com cartão salvo - o WHMCS
+ *      não distingue os dois casos aqui. Exige CVV só no segundo caso (ver
+ *      pagarme_isNewOrderInvoice()); cron nunca tem CVV disponível.
  *   2. Caso contrário -> cobra os dados de cartão digitados no checkout
  *
  * @param array $params Parâmetros enviados pelo WHMCS
@@ -275,6 +278,34 @@ function pagarme_capture($params)
             );
         }
 
+        // CVV em cartão salvo: exigido só em pedido novo (o cliente está na
+        // tela, digitou o CVV, e os apps já bloqueiam o submit sem ele - ver
+        // /pay-card nos dois apps). Renovação/recorrência via cron nunca tem
+        // CVV disponível (sem sessão de navegador) - por isso não é exigido
+        // ali, mesmo comportamento de sempre. pagarme_isNewOrderInvoice()
+        // é o sinal que distingue os dois: WHMCS não manda contexto
+        // cron-vs-manual para o módulo, então usamos o status do serviço
+        // ligado à fatura (Pending = pedido novo).
+        $savedCardCvv = pagarme_getCvv($params);
+
+        if (empty($savedCardCvv) && pagarme_isNewOrderInvoice($params)) {
+            pagarme_log($params, array(
+                'gatewayid' => $params['gatewayid'],
+            ), 'capture: CVV ausente para cartão salvo em pedido novo');
+
+            return array(
+                'status'  => 'declined',
+                'rawdata' => 'CVV obrigatório para pagar com cartão salvo neste pedido.',
+            );
+        }
+
+        $savedCard = array(
+            'billing_address' => pagarme_buildAddress($params),
+        );
+        if (!empty($savedCardCvv)) {
+            $savedCard['cvv'] = $savedCardCvv;
+        }
+
         $payload = array(
             'customer_id' => $token['customer_id'],
             'items'       => $items,
@@ -285,9 +316,7 @@ function pagarme_capture($params)
                         'installments'         => $installments,
                         'statement_descriptor' => $descriptor,
                         'card_id'              => $token['card_id'],
-                        'card'                 => array(
-                            'billing_address' => pagarme_buildAddress($params),
-                        ),
+                        'card'                 => $savedCard,
                     ),
                 ),
             ),
@@ -913,13 +942,92 @@ function pagarme_isInvoiceAnnual($params)
 }
 
 /**
+ * Verifica se a fatura cobra ao menos um serviço ainda "Pending" - ou seja,
+ * é a fatura de um PEDIDO NOVO (o serviço só vira "Active" quando esta
+ * fatura é paga), não uma renovação/recorrência de um serviço já ativo.
+ *
+ * Usado para exigir CVV em cartão salvo só em pedido novo: o WHMCS não
+ * distingue "cron de recorrência" de "cliente pagando fatura nova" dentro de
+ * pagarme_capture() - os dois chegam com $params['gatewayid'] preenchido do
+ * mesmo jeito. O status do serviço ligado à fatura é o sinal nativo do
+ * WHMCS que separa os dois casos: cron/renovação sempre incide sobre
+ * serviço já Active; pedido novo sempre nasce Pending até esta fatura
+ * quitar. Mesmo padrão de leitura de itens/serviço de pagarme_isInvoiceAnnual().
+ *
+ * Fatura sem nenhum item de serviço identificável (ex: só domínio avulso,
+ * ou taxa administrativa) é tratada como pedido novo por padrão - mais
+ * seguro exigir CVV à toa do que deixar de exigir num caso real de compra.
+ *
+ * @param array $params
+ * @return bool
+ */
+function pagarme_isNewOrderInvoice($params)
+{
+    if (!function_exists('localAPI') || empty($params['invoiceid'])) {
+        return true;
+    }
+
+    $invoice = localAPI('GetInvoice', array('invoiceid' => $params['invoiceid']));
+
+    if (empty($invoice['items']['item'])) {
+        return true;
+    }
+
+    $items = $invoice['items']['item'];
+    // A API pode retornar um único item como array associativo simples
+    if (isset($items['id'])) {
+        $items = array($items);
+    }
+
+    // Só itens de Hosting/Addon têm relid apontando para tblhosting - um
+    // item de Domínio tem relid de tbldomains (outra tabela, outro espaço de
+    // ids) e GetClientsProducts não serve pra ele. Mesma restrição de
+    // pagarme_isInvoiceAnnual()/pagarme_minMonthsForInvoice().
+    $foundHostingItem = false;
+
+    foreach ($items as $item) {
+        if (empty($item['type']) || strtolower($item['type']) !== 'hosting') {
+            continue;
+        }
+        if (empty($item['relid'])) {
+            continue;
+        }
+
+        $foundHostingItem = true;
+
+        $service = localAPI('GetClientsProducts', array('serviceid' => $item['relid']));
+        $status  = isset($service['products']['product'][0]['status'])
+            ? $service['products']['product'][0]['status']
+            : null;
+
+        // Qualquer serviço ainda Pending nesta fatura já basta para tratar
+        // como pedido novo, mesmo numa fatura com múltiplos itens.
+        if ($status === 'Pending') {
+            return true;
+        }
+    }
+
+    // Nenhum item de Hosting identificável (ex: só domínio avulso, ou
+    // add-on/taxa sem relid) - não dá pra confirmar que é renovação de
+    // serviço já ativo, então trata como pedido novo (mesma cautela do
+    // caso de fatura sem itens, acima).
+    if (!$foundHostingItem) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
  * Obtém o CVV do cartão.
  *
- * O WHMCS não inclui o CVV nos parâmetros passados para storeremote (por
- * conformidade PCI-DSS, o CVV não pode ser armazenado), mas a Pagar.me exige
- * o CVV para criar um cartão salvo. Por isso buscamos também no POST da
- * requisição atual, onde o valor existe em memória enquanto o cliente submete
- * o formulário.
+ * O WHMCS não inclui o CVV nos parâmetros passados para storeremote nem para
+ * capture de cartão salvo (por conformidade PCI-DSS, o CVV não pode ser
+ * armazenado), mas a Pagar.me aceita/exige o CVV nesses dois casos. Por isso
+ * buscamos também no POST/REQUEST da requisição atual, onde o valor existe em
+ * memória enquanto o cliente submete o formulário (storeremote) ou enquanto
+ * os apps chamam CapturePayment com `cvv` no corpo (capture de cartão salvo -
+ * ver pagarme_isNewOrderInvoice()).
  *
  * O CVV é usado apenas nesta requisição e nunca é armazenado ou logado.
  *

@@ -266,11 +266,21 @@ Hipótese de trabalho: o WHMCS não resolve o `ccinfo` recebido como um pay meth
 válido do cliente e, ao não reconhecê-lo, cai no caminho de "cartão novo" e
 valida o número — que está vazio.
 
-**O CVV está descartado como causa.** O caminho de cartão salvo do módulo
-(`pagarme_capture`, cenário `gatewayid`) monta o payload com `customer_id` +
-`card_id` e não envia CVV; é o mesmo caminho usado no pagamento de fatura, que
-funciona. O campo de CVV que aparece na tela de fatura é renderizado pelo WHMCS
-mas ignorado pelo módulo nesse fluxo.
+**O CVV está descartado como causa** (para ESTA investigação específica, ver
+nota abaixo). No momento desta investigação, o caminho de cartão salvo do
+módulo (`pagarme_capture`, cenário `gatewayid`) montava o payload só com
+`customer_id` + `card_id`, sem CVV; era o mesmo caminho usado no pagamento de
+fatura, que funcionava. O campo de CVV que aparece na tela de fatura era
+renderizado pelo WHMCS mas ignorado pelo módulo nesse fluxo.
+
+> **Atualização (17/08/2026):** esse comportamento mudou. `pagarme_capture()`
+> agora exige e envia o CVV para cartão salvo quando a fatura é de PEDIDO NOVO
+> (serviço ainda `Pending`) - ver `pagarme_isNewOrderInvoice()` no módulo.
+> Renovação/recorrência via cron continua sem exigir CVV (nunca há CVV
+> disponível nesse contexto). A conclusão acima permanece válida para a
+> investigação original (o CVV não era a causa daquele bug específico de
+> order form), mas a frase "ignorado pelo módulo nesse fluxo" não é mais
+> verdadeira em geral.
 
 ### Hipóteses descartadas
 
