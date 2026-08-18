@@ -552,7 +552,7 @@ function pagarme_emvReasonMap()
     $cvvInvalido = 'Código de segurança (CVV) inválido ou não informado. Verifique os números '
         . 'no verso do cartão.';
     $cartaoVencido = 'Cartão vencido ou data de validade incorreta. Verifique os dados do cartão.';
-    $saldoInsuficiente = 'Saldo ou limite insuficiente para esta compra. Tente outro cartão ou '
+    $saldoInsuficiente = 'Tente outro cartão ou '
         . 'entre em contato com seu banco.';
     $cartaoRestrito = 'Cartão bloqueado ou com restrição. Entre em contato com seu banco ou tente '
         . 'outro cartão.';
