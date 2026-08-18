@@ -301,9 +301,18 @@ function pagarme_capture($params)
         // é o sinal que distingue os dois: WHMCS não manda contexto
         // cron-vs-manual para o módulo, então usamos o status do serviço
         // ligado à fatura (Pending = pedido novo).
+        //
+        // Exceção: cartão tokenizado com CVV confirmado há pouco tempo
+        // (pagarme_recentlyTokenizedWithCvv) - fluxo "cadastrar cartão novo +
+        // pagar na hora". O CVV já foi validado no storeremote; os apps não
+        // reenviam de propósito (mesma lógica de não pedir a mesma senha duas
+        // vezes na mesma operação - ver newCardAuthorization/JWT nos apps).
+        // Sem esta exceção, esse fluxo pedia CVV duas vezes seguidas e
+        // recusava a captura mesmo o cliente tendo acabado de confirmá-lo.
         $savedCardCvv = pagarme_getCvv($params);
+        $cvvRecentlyConfirmed = pagarme_recentlyTokenizedWithCvv($token);
 
-        if (empty($savedCardCvv) && pagarme_isNewOrderInvoice($params)) {
+        if (empty($savedCardCvv) && !$cvvRecentlyConfirmed && pagarme_isNewOrderInvoice($params)) {
             pagarme_log($params, array(
                 'gatewayid' => $params['gatewayid'],
             ), 'capture: CVV ausente para cartão salvo em pedido novo');
@@ -952,7 +961,17 @@ function pagarme_storeremote($params)
 
     return array(
         'status'    => 'success',
-        'gatewayid' => pagarme_buildToken($customer['id'], $card['id'], isset($card['brand']) ? $card['brand'] : ''),
+        // CVV já foi confirmado agora (linha 971 acima recusa antes de chegar
+        // aqui se estivesse ausente) - carimba o momento para
+        // pagarme_recentlyTokenizedWithCvv() dispensar CVV numa captura
+        // imediatamente seguinte (fluxo "cadastrar cartão novo + pagar na
+        // hora"), sem pedir CVV duas vezes pela mesma operação do cliente.
+        'gatewayid' => pagarme_buildToken(
+            $customer['id'],
+            $card['id'],
+            isset($card['brand']) ? $card['brand'] : '',
+            time()
+        ),
         'cardType'  => isset($card['brand']) ? $card['brand'] : '',
         'lastFour'  => isset($card['last_four_digits']) ? $card['last_four_digits'] : '',
         'expDate'   => $cardExpiry,
@@ -1593,19 +1612,34 @@ function pagarme_parsePhone($phoneNumber)
  * Codifica customer_id + card_id em um único token, armazenado pelo WHMCS
  * no campo "gatewayid" para uso em cobranças futuras.
  *
+ * $tokenizedAt (timestamp Unix, opcional): quando o cartão foi tokenizado
+ * com CVV confirmado por pagarme_storeremote(). Usado por
+ * pagarme_capture() para dispensar a exigência de CVV numa janela curta
+ * logo após o cadastro (ver pagarme_recentlyTokenizedWithCvv()) - sem isso,
+ * o fluxo "cadastrar cartão novo + pagar na hora" pede CVV duas vezes: uma
+ * no cadastro (storeremote), outra na captura, mesmo sendo a mesma operação
+ * do cliente. Ausente/vazio para chamadas que não vêm de um cadastro
+ * (ex: pagarme_removeremote() nunca precisa disso).
+ *
  * @param string $customerId
  * @param string $cardId
+ * @param string $brand
+ * @param int|null $tokenizedAt
  * @return string
  */
-function pagarme_buildToken($customerId, $cardId, $brand = '')
+function pagarme_buildToken($customerId, $cardId, $brand = '', $tokenizedAt = null)
 {
-    // Formato: customer_id|card_id|brand (brand opcional, para a tabela de taxas)
-    return $customerId . '|' . $cardId . '|' . $brand;
+    // Formato: customer_id|card_id|brand|tokenizedAt (brand e tokenizedAt
+    // opcionais - tokens antigos sem eles continuam válidos, ver parseToken).
+    $timestamp = $tokenizedAt !== null ? (string) $tokenizedAt : '';
+    return $customerId . '|' . $cardId . '|' . $brand . '|' . $timestamp;
 }
 
 /**
- * Decodifica o token salvo pelo WHMCS de volta em customer_id + card_id + brand.
- * Tolera tokens antigos no formato customer_id|card_id (sem bandeira).
+ * Decodifica o token salvo pelo WHMCS de volta em customer_id + card_id +
+ * brand + tokenized_at. Tolera tokens antigos nos formatos
+ * customer_id|card_id (sem bandeira) e customer_id|card_id|brand (sem
+ * timestamp, gerados antes desta mudança).
  *
  * @param string $token
  * @return array|null
@@ -1620,14 +1654,41 @@ function pagarme_parseToken($token)
     $customerId = isset($parts[0]) ? $parts[0] : '';
     $cardId     = isset($parts[1]) ? $parts[1] : '';
     $brand      = isset($parts[2]) ? $parts[2] : '';
+    $tokenizedAt = isset($parts[3]) && $parts[3] !== '' ? (int) $parts[3] : null;
 
     if (empty($customerId) || empty($cardId)) {
         return null;
     }
 
     return array(
-        'customer_id' => $customerId,
-        'card_id'     => $cardId,
-        'brand'       => $brand,
+        'customer_id'  => $customerId,
+        'card_id'      => $cardId,
+        'brand'        => $brand,
+        'tokenized_at' => $tokenizedAt,
     );
+}
+
+/**
+ * Se o cartão foi tokenizado com CVV confirmado nos últimos N minutos, a
+ * captura seguinte não precisa exigir CVV de novo - é a mesma operação do
+ * cliente (cadastrar cartão novo + pagar na hora), só em duas chamadas
+ * separadas. Passada essa janela, volta a exigir CVV normalmente (cartão
+ * salvo de sessão anterior).
+ *
+ * Janela curta o bastante para não virar uma forma de reusar CVV velho
+ * indefinidamente, longa o bastante para cobrir o tempo real entre
+ * storeremote e capture no fluxo dos apps (parcelamento, troca de gateway,
+ * confirmação do usuário).
+ *
+ * @param array|null $token Retorno de pagarme_parseToken()
+ * @param int $windowSeconds
+ * @return bool
+ */
+function pagarme_recentlyTokenizedWithCvv($token, $windowSeconds = 600)
+{
+    if (empty($token) || empty($token['tokenized_at'])) {
+        return false;
+    }
+
+    return (time() - (int) $token['tokenized_at']) <= $windowSeconds;
 }

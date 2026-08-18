@@ -271,6 +271,23 @@ Código não mapeado cai num fallback genérico seguro, nunca fica sem mensagem.
 Requer o mesmo passo de instalação das outras custom actions (registrar + liberar no papel de
 API) — ver `includes/api/README.md`.
 
+## 10. CVV em cartão salvo: quando é exigido
+
+`pagarme_capture()` exige CVV para cobrar um cartão salvo **só** quando a fatura é de um
+**pedido novo** (`pagarme_isNewOrderInvoice()` — o serviço ligado à fatura ainda está `Pending`,
+nasce `Active` só quando a fatura é paga). Renovação/recorrência (via cron ou qualquer captura
+sobre serviço já `Active`) nunca exige CVV — não há como fornecê-lo nesse contexto (cron não
+tem sessão de navegador).
+
+**Exceção**: cartão tokenizado com CVV confirmado nos últimos 10 minutos
+(`pagarme_recentlyTokenizedWithCvv()`) não exige CVV de novo na captura seguinte. Cobre o fluxo
+"cadastrar cartão novo + pagar na hora" (checkout, QuickBuy): o cliente já digitou o CVV para
+salvar o cartão (`pagarme_storeremote()`, que recusa sem CVV) — pedir de novo na captura, poucos
+segundos depois, seria pedir a mesma senha duas vezes pela mesma operação. O carimbo de tempo
+vai dentro do próprio token (`gatewayid`, formato `customer_id|card_id|brand|tokenizedAt`) — sem
+tabela nova, sem estado extra a limpar. Cartões salvos de sessões anteriores (sem o carimbo
+recente, incluindo todo token gerado antes desta mudança) continuam exigindo CVV normalmente.
+
 ## Observações importantes
 
 - **PCI-DSS**: como o cartão é digitado diretamente no seu site (sem tokenização
