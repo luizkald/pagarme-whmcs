@@ -115,6 +115,14 @@ function pagarme_capture($params)
     $secretKey = pagarme_getSecretKey($params);
 
     if (empty($secretKey)) {
+        // Erro de configuração do lojista, nunca do cliente - mensagem
+        // gravada para o app é genérica de propósito, sem citar "Secret Key"
+        // (detalhe interno que não ajuda quem está pagando).
+        pagarme_storeLastError(
+            pagarme_clientIdFromParams($params),
+            'technical_error',
+            'O serviço de pagamento está temporariamente indisponível. Tente novamente em alguns instantes.'
+        );
         return array(
             'status'  => 'declined',
             'rawdata' => 'Secret Key não configurada no módulo de pagamento.',
@@ -159,10 +167,12 @@ function pagarme_capture($params)
                 'status'       => $stored['status'],
                 'installments' => $stored['installments'],
             ), 'capture: seleção de parcelamento obsoleta');
+            $installmentsStaleMsg = 'A seleção de parcelamento expirou ou os valores da fatura '
+                . 'mudaram. Refaça a escolha de parcelas antes de pagar.';
+            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'stale_installments', $installmentsStaleMsg);
             return array(
                 'status'  => 'declined',
-                'rawdata' => 'A seleção de parcelamento expirou ou os valores da fatura mudaram. '
-                    . 'Refaça a escolha de parcelas antes de pagar.',
+                'rawdata' => $installmentsStaleMsg,
             );
         }
     }
@@ -238,6 +248,9 @@ function pagarme_capture($params)
                 'installments' => $installments,
                 'fee'          => $feeAmount,
             ), 'capture: falha ao aplicar juros na fatura');
+            $reconcileFailMsg = 'Não foi possível processar o parcelamento desta fatura. Tente '
+                . 'novamente em alguns instantes.';
+            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'technical_error', $reconcileFailMsg);
             return array(
                 'status'  => 'declined',
                 'rawdata' => 'Não foi possível aplicar a taxa de parcelamento na fatura.',
@@ -272,6 +285,8 @@ function pagarme_capture($params)
         $token = pagarme_parseToken($params['gatewayid']);
 
         if (!$token) {
+            $tokenInvalidMsg = 'Não foi possível usar este cartão salvo. Cadastre o cartão novamente.';
+            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'saved_card_invalid', $tokenInvalidMsg);
             return array(
                 'status'  => 'declined',
                 'rawdata' => 'Token de cartão salvo inválido ou corrompido.',
@@ -293,6 +308,8 @@ function pagarme_capture($params)
                 'gatewayid' => $params['gatewayid'],
             ), 'capture: CVV ausente para cartão salvo em pedido novo');
 
+            $cvvRequiredMsg = 'Informe o código de segurança (CVV) do cartão para concluir este pagamento.';
+            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'cvv_required', $cvvRequiredMsg);
             return array(
                 'status'  => 'declined',
                 'rawdata' => 'CVV obrigatório para pagar com cartão salvo neste pedido.',
@@ -327,6 +344,13 @@ function pagarme_capture($params)
         $document = pagarme_getCustomerDocument($params);
 
         if (empty($document)) {
+            // Mensagem interna (rawdata/Gateway Log) é acionável para o admin
+            // configurar o módulo. A gravada para o cliente é diferente: ele
+            // não pode resolver "Custom Client Field ausente" - só pode
+            // completar o próprio cadastro.
+            $documentMissingMsg = 'CPF/CNPJ não encontrado no seu cadastro. Atualize seus dados '
+                . 'cadastrais antes de tentar novamente.';
+            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'missing_document', $documentMissingMsg);
             return array(
                 'status'  => 'declined',
                 'rawdata' => 'CPF/CNPJ do cliente não encontrado. Cadastre um Custom Client Field '
@@ -365,6 +389,10 @@ function pagarme_capture($params)
 
     if ($response === false) {
         pagarme_log($params, $api->getLastError(), 'capture: falha na comunicação/validação');
+        pagarme_classifyAndStore(
+            array('apiError' => $api->getLastErrorDetails()),
+            pagarme_clientIdFromParams($params)
+        );
         return array(
             'status'  => 'declined',
             'rawdata' => $api->getLastError(),
@@ -375,6 +403,7 @@ function pagarme_capture($params)
 
     if (!$charge || empty($charge['status'])) {
         pagarme_log($params, $response, 'capture: resposta sem cobrança válida');
+        pagarme_classifyAndStore(array(), pagarme_clientIdFromParams($params));
         return array(
             'status'  => 'declined',
             'rawdata' => $response,
@@ -456,6 +485,7 @@ function pagarme_capture($params)
             // Extrai um motivo legível da recusa quando disponível
             $motivo = pagarme_extractDeclineReason($charge);
             pagarme_log($params, $response, 'capture: recusado (' . $charge['status'] . ') ' . $motivo);
+            pagarme_classifyAndStore(array('charge' => $charge), pagarme_clientIdFromParams($params));
             return array(
                 'status'  => 'declined',
                 'rawdata' => $response,
@@ -487,6 +517,267 @@ function pagarme_extractDeclineReason($charge)
     }
 
     return '';
+}
+
+/**
+ * Tabela de códigos de retorno EMV/adquirente -> motivo seguro de exibir ao
+ * cliente. Fonte: central de ajuda da Pagar.me (motivos de recusa de uma
+ * transação). Cobre os códigos mais comuns em produção; qualquer código
+ * ausente cai no fallback genérico de pagarme_classifyDeclineReason().
+ *
+ * Cada entrada: [code => motivo curto e seguro, action => o que o cliente
+ * pode fazer]. Nunca inclui o código numérico cru nem texto da adquirente na
+ * mensagem final - só a tradução.
+ *
+ * @return array<string, array{code:string, message:string}>
+ */
+function pagarme_emvReasonMap()
+{
+    static $map = null;
+    if ($map !== null) {
+        return $map;
+    }
+
+    $contateBanco = 'Pagamento recusado pelo banco emissor do cartão. Entre em contato com seu '
+        . 'banco ou tente outro cartão.';
+    $cvvInvalido = 'Código de segurança (CVV) inválido ou não informado. Verifique os números '
+        . 'no verso do cartão.';
+    $cartaoVencido = 'Cartão vencido ou data de validade incorreta. Verifique os dados do cartão.';
+    $saldoInsuficiente = 'Saldo ou limite insuficiente para esta compra. Tente outro cartão ou '
+        . 'entre em contato com seu banco.';
+    $cartaoRestrito = 'Cartão bloqueado ou com restrição. Entre em contato com seu banco ou tente '
+        . 'outro cartão.';
+    $suspeitaFraude = 'A transação foi recusada por segurança. Tente outro cartão ou entre em '
+        . 'contato com seu banco.';
+    $timeout = 'O banco emissor não respondeu a tempo. Tente novamente em alguns instantes.';
+    $erroTecnico = 'Não foi possível processar o pagamento no momento. Tente novamente.';
+
+    $map = array(
+        // Recusa genérica / banco
+        '1000' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '1007' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '1008' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '2000' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '5093' => array('code' => 'not_authorized', 'message' => $contateBanco),
+
+        // Cartão vencido
+        '1001' => array('code' => 'card_expired', 'message' => $cartaoVencido),
+        '2001' => array('code' => 'card_expired', 'message' => $cartaoVencido),
+
+        // Suspeita de fraude / segurança
+        '1002' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
+        '1022' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
+        '1024' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
+        '1029' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
+        '2002' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
+        '2010' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
+
+        // Cartão com restrição / bloqueado
+        '1004' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '1025' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '1032' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '1035' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '1040' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '2004' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '2007' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '2008' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '2009' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+
+        // Saldo/limite insuficiente
+        '1016' => array('code' => 'insufficient_funds', 'message' => $saldoInsuficiente),
+
+        // CVV / código de segurança
+        '1045' => array('code' => 'cvv_invalid', 'message' => $cvvInvalido),
+        '5025' => array('code' => 'cvv_invalid', 'message' => $cvvInvalido),
+        '9124' => array('code' => 'cvv_invalid', 'message' => $cvvInvalido),
+
+        // Senha (cartão de débito com senha, fora do escopo de crédito, mas
+        // pode aparecer em cartões múltiplos função)
+        '1006' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '1017' => array('code' => 'not_authorized', 'message' => $contateBanco),
+
+        // Timeout / indisponibilidade do banco - vale tentar de novo
+        '9107' => array('code' => 'issuer_unavailable', 'message' => $timeout),
+        '9109' => array('code' => 'issuer_unavailable', 'message' => $timeout),
+        '9110' => array('code' => 'issuer_unavailable', 'message' => $timeout),
+        '9111' => array('code' => 'issuer_unavailable', 'message' => $timeout),
+        '9112' => array('code' => 'issuer_unavailable', 'message' => $timeout),
+
+        // Erros técnicos do lado da adquirente/loja - não é problema do cartão
+        '5000' => array('code' => 'technical_error', 'message' => $erroTecnico),
+        '9100' => array('code' => 'technical_error', 'message' => $erroTecnico),
+        '9999' => array('code' => 'technical_error', 'message' => $erroTecnico),
+    );
+
+    return $map;
+}
+
+/**
+ * Classifica o motivo de uma recusa/erro em um par (code, message) SEGURO
+ * para mostrar ao cliente - nunca o JSON cru da Pagar.me, nunca dados que a
+ * API ecoou de volta (endereço, nome, telefone), nunca detalhe de
+ * infraestrutura (chave de API, status HTTP interno).
+ *
+ * Aceita duas formas de entrada:
+ *   - array com 'charge' => resposta de charge da Pagar.me (capture)
+ *   - array com 'apiError' => PagarmeApi::getLastErrorDetails() (create
+ *     customer/card, ou qualquer chamada que devolveu 4xx)
+ *
+ * Motivo não reconhecido cai num fallback genérico seguro - a mensagem NUNCA
+ * fica vazia nem expõe o dado bruto por trás.
+ *
+ * @param array $context
+ * @return array{code:string, message:string}
+ */
+function pagarme_classifyDeclineReason($context)
+{
+    $generic = array(
+        'code'    => 'declined',
+        'message' => 'Não foi possível processar o pagamento. Tente novamente ou use outro cartão.',
+    );
+
+    // --- Caminho 1: recusa de cobrança (charge.last_transaction) ---
+    if (!empty($context['charge'])) {
+        $charge = $context['charge'];
+        $lt     = isset($charge['last_transaction']) ? $charge['last_transaction'] : array();
+
+        $emvCode = null;
+        foreach (array('acquirer_return_code', 'gateway_response') as $key) {
+            if (!empty($lt[$key])) {
+                $value = $lt[$key];
+                if (is_array($value) && !empty($value['code'])) {
+                    $emvCode = (string) $value['code'];
+                } elseif (!is_array($value)) {
+                    $emvCode = (string) $value;
+                }
+                if ($emvCode !== null) {
+                    break;
+                }
+            }
+        }
+
+        if ($emvCode !== null) {
+            $map = pagarme_emvReasonMap();
+            if (isset($map[$emvCode])) {
+                return $map[$emvCode];
+            }
+        }
+
+        // Antifraude: recusado antes de chegar ao adquirente/emissor.
+        if (!empty($charge['status']) && $charge['status'] === 'failed'
+            && !empty($lt['status']) && stripos((string) $lt['status'], 'refus') !== false
+        ) {
+            return array(
+                'code'    => 'security_declined',
+                'message' => 'A transação foi recusada por segurança. Tente outro cartão ou entre '
+                    . 'em contato com seu banco.',
+            );
+        }
+
+        return $generic;
+    }
+
+    // --- Caminho 2: erro de validação/API (create customer, create card) ---
+    if (!empty($context['apiError'])) {
+        $apiError = $context['apiError'];
+        $errors   = isset($apiError['errors']) && is_array($apiError['errors']) ? $apiError['errors'] : array();
+
+        // Campos específicos que o CLIENTE consegue agir sobre. Nunca inclui
+        // o valor que ele digitou (a Pagar.me ecoa isso em 'request', que
+        // este classificador nunca lê) - só o NOME do campo problemático,
+        // traduzido para uma instrução segura.
+        $fieldMessages = array(
+            'card.exp_month'    => 'Data de validade do cartão inválida. Verifique o mês e o ano no cartão.',
+            'card.exp_year'     => 'Data de validade do cartão inválida. Verifique o mês e o ano no cartão.',
+            'card'              => 'Dados do cartão inválidos. Verifique o número, validade e código de segurança.',
+            'card.number'       => 'Número do cartão inválido. Verifique os dígitos e tente novamente.',
+            'card.cvv'          => 'Código de segurança (CVV) inválido. Verifique os números no verso do cartão.',
+            'card.holder_name'  => 'Nome do titular do cartão inválido ou ausente.',
+            'card.billing_address.zip_code' => 'CEP de cobrança inválido. Verifique o endereço cadastrado.',
+            'customer.name'     => 'Nome do titular ausente ou inválido no cadastro. Atualize seus '
+                . 'dados cadastrais antes de tentar novamente.',
+            'customer.email'    => 'E-mail cadastrado inválido. Atualize seus dados cadastrais.',
+            'customer.document' => 'CPF/CNPJ inválido ou ausente no cadastro. Atualize seus dados '
+                . 'cadastrais antes de tentar novamente.',
+            'customer.address.zip_code' => 'CEP inválido no cadastro. Atualize seus dados cadastrais.',
+        );
+
+        foreach ($fieldMessages as $field => $message) {
+            if (isset($errors[$field])) {
+                return array('code' => 'invalid_field', 'message' => $message);
+            }
+        }
+
+        // Campo não mapeado, mas a API disse claramente que é um problema de
+        // validação (4xx com 'errors'): ainda assim não repassamos o texto
+        // cru (pode ecoar dado digitado) - fallback genérico de validação.
+        if (!empty($errors)) {
+            return array(
+                'code'    => 'invalid_field',
+                'message' => 'Alguns dados informados são inválidos. Verifique o cartão e seus '
+                    . 'dados cadastrais e tente novamente.',
+            );
+        }
+
+        $httpCode = isset($apiError['httpCode']) ? (int) $apiError['httpCode'] : 0;
+        if ($httpCode === 404) {
+            return array(
+                'code'    => 'technical_error',
+                'message' => 'Não foi possível localizar seu cadastro de pagamento. Tente novamente '
+                    . 'ou cadastre o cartão de novo.',
+            );
+        }
+        if ($httpCode >= 500 || $httpCode === 0) {
+            return array(
+                'code'    => 'technical_error',
+                'message' => 'O serviço de pagamento está temporariamente indisponível. Tente '
+                    . 'novamente em alguns instantes.',
+            );
+        }
+
+        return $generic;
+    }
+
+    return $generic;
+}
+
+// =========================================================================
+// Motivo do último erro (para os apps mostrarem algo além de "recusado")
+// =========================================================================
+//
+// Armazenamento (pagarme_ensureLastErrorTable/pagarme_storeLastError) mora
+// em modules/gateways/pagarme/installments.php, não aqui - mesmo motivo que
+// mod_pagarme_installments mora lá: é o arquivo que as custom API actions em
+// includes/api/ já carregam sem exigir WHMCS definida (pagarme.php tem
+// `if (!defined('WHMCS')) die(...)` no topo, installments.php não).
+
+/**
+ * Classifica e já grava de uma vez - atalho usado nos pontos de decline de
+ * pagarme_capture()/pagarme_storeremote(). Sempre retorna o par (code,
+ * message) classificado, mesmo se a gravação falhar.
+ *
+ * @param array      $context  Ver pagarme_classifyDeclineReason()
+ * @param int|string $clientId
+ * @return array{code:string, message:string}
+ */
+function pagarme_classifyAndStore($context, $clientId)
+{
+    $reason = pagarme_classifyDeclineReason($context);
+    pagarme_storeLastError($clientId, $reason['code'], $reason['message']);
+    return $reason;
+}
+
+/**
+ * Extrai o clientid de $params, para os pontos de decline que só têm uma
+ * mensagem própria (não vieram de charge/apiError da Pagar.me) e por isso
+ * gravam o motivo diretamente, sem passar por pagarme_classifyDeclineReason().
+ *
+ * @param array $params
+ * @return int
+ */
+function pagarme_clientIdFromParams($params)
+{
+    return isset($params['clientdetails']['userid']) ? (int) $params['clientdetails']['userid'] : 0;
 }
 
 /**
@@ -549,6 +840,11 @@ function pagarme_storeremote($params)
     $secretKey = pagarme_getSecretKey($params);
 
     if (empty($secretKey)) {
+        pagarme_storeLastError(
+            pagarme_clientIdFromParams($params),
+            'technical_error',
+            'O serviço de pagamento está temporariamente indisponível. Tente novamente em alguns instantes.'
+        );
         return array(
             'status'  => 'declined',
             'rawdata' => 'Secret Key não configurada no módulo de pagamento.',
@@ -573,6 +869,12 @@ function pagarme_storeremote($params)
             'clientid'  => isset($params['clientdetails']['userid']) ? $params['clientdetails']['userid'] : null,
             'fieldName' => isset($params['cpfCustomField']) ? $params['cpfCustomField'] : null,
         ), 'storeremote: ' . $reason);
+        pagarme_storeLastError(
+            pagarme_clientIdFromParams($params),
+            'missing_document',
+            'CPF/CNPJ não encontrado no seu cadastro. Atualize seus dados cadastrais antes de '
+                . 'salvar um cartão.'
+        );
         return array(
             'status'  => 'declined',
             'rawdata' => $reason,
@@ -590,6 +892,10 @@ function pagarme_storeremote($params)
     if ($customer === false || empty($customer['id'])) {
         $err = $api->getLastError() ?: 'Não foi possível criar o cliente na Pagar.me.';
         pagarme_log($params, $err, 'storeremote: falha ao criar cliente');
+        pagarme_classifyAndStore(
+            array('apiError' => $api->getLastErrorDetails()),
+            pagarme_clientIdFromParams($params)
+        );
         return array(
             'status'  => 'declined',
             'rawdata' => $err,
@@ -605,6 +911,11 @@ function pagarme_storeremote($params)
             . 'um cartão, mas o WHMCS não o fornece em atualizações automáticas. '
             . 'Peça ao cliente para cadastrar o cartão novamente informando o código de segurança.';
         pagarme_log($params, array('action' => $action), 'storeremote: CVV indisponível');
+        pagarme_storeLastError(
+            pagarme_clientIdFromParams($params),
+            'cvv_required',
+            'Informe o código de segurança (CVV) para salvar este cartão.'
+        );
         return array(
             'status'  => 'declined',
             'rawdata' => $reason,
@@ -622,6 +933,10 @@ function pagarme_storeremote($params)
     if ($card === false || empty($card['id'])) {
         $err = $api->getLastError() ?: 'Não foi possível salvar o cartão na Pagar.me.';
         pagarme_log($params, $err, 'storeremote: falha ao salvar cartão');
+        pagarme_classifyAndStore(
+            array('apiError' => $api->getLastErrorDetails()),
+            pagarme_clientIdFromParams($params)
+        );
         return array(
             'status'  => 'declined',
             'rawdata' => $err,

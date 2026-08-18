@@ -846,6 +846,83 @@ function pagarme_ensureInstallmentsTable()
     }
 }
 
+// =========================================================================
+// Motivo do último erro (para os apps mostrarem algo além de "recusado")
+// =========================================================================
+//
+// Mora aqui (não em pagarme.php) para as custom API actions em
+// includes/api/ poderem usar sem carregar o módulo de gateway inteiro - o
+// mesmo motivo pelo qual mod_pagarme_installments também vive aqui. A
+// classificação em si (pagarme_classifyDeclineReason/pagarme_classifyAndStore)
+// continua em pagarme.php, que já dá require_once neste arquivo.
+
+/**
+ * Garante que a tabela mod_pagarme_last_error existe. Guarda só (code,
+ * message) já classificados por pagarme_classifyDeclineReason() - NUNCA o
+ * JSON cru da Pagar.me nem dado de cartão/pessoal. Chave por clientid (não
+ * por invoice): cobre tanto falha de captura quanto falha ao salvar cartão
+ * (que não tem invoice nenhuma). TTL curto porque só serve para o app ler de
+ * volta na mesma tentativa que acabou de falhar - ver GetPagarmeLastError em
+ * includes/api/.
+ *
+ * @return bool
+ */
+function pagarme_ensureLastErrorTable()
+{
+    static $checked = null;
+    if ($checked !== null) {
+        return $checked;
+    }
+
+    try {
+        $schema = \WHMCS\Database\Capsule::schema();
+        if (!$schema->hasTable('mod_pagarme_last_error')) {
+            $schema->create('mod_pagarme_last_error', function ($table) {
+                $table->integer('clientid')->primary();
+                $table->string('code', 40);
+                $table->string('message', 500);
+                $table->dateTime('expires_at');
+            });
+        }
+        return $checked = true;
+    } catch (\Exception $e) {
+        return $checked = false;
+    }
+}
+
+/**
+ * Grava o motivo (já classificado, seguro) do erro mais recente de um
+ * cliente, para o app headless poder buscar em seguida via
+ * GetPagarmeLastError. Best-effort: uma falha aqui nunca deve interromper o
+ * fluxo de pagamento que já retornou 'declined' para o WHMCS.
+ *
+ * @param int|string $clientId
+ * @param string     $code
+ * @param string     $message
+ * @param int        $ttlSeconds
+ * @return void
+ */
+function pagarme_storeLastError($clientId, $code, $message, $ttlSeconds = 120)
+{
+    $clientId = (int) $clientId;
+    if ($clientId <= 0 || !pagarme_ensureLastErrorTable()) {
+        return;
+    }
+
+    try {
+        \WHMCS\Database\Capsule::table('mod_pagarme_last_error')->updateOrInsert(
+            array('clientid' => $clientId),
+            array(
+                'code'       => substr((string) $code, 0, 40),
+                'message'    => substr((string) $message, 0, 500),
+                'expires_at' => date('Y-m-d H:i:s', time() + $ttlSeconds),
+            )
+        );
+    } catch (\Exception $e) {
+        // Best-effort - nunca interrompe o fluxo de pagamento.
+    }
+}
+
 /**
  * Grava a parcela escolhida para uma fatura, junto do modo de cálculo que
  * estava ao vivo no momento da escolha (fórmula + margem + fonte/valor da

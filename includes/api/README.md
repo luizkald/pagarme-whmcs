@@ -15,31 +15,34 @@ que garante que o valor exibido ao cliente seja o mesmo que será cobrado.
 |---|---|---|
 | `GetPagarmeInstallments` | `getpagarmeinstallments.php` | Lista as opções de parcelamento |
 | `SetPagarmeInstallments` | `setpagarmeinstallments.php` | Registra a escolha antes da captura |
+| `GetPagarmeLastError` | `getpagarmelasterror.php` | Motivo do último erro de pagamento/cartão |
 
 ## Instalação
 
-1. Copiar os dois `.php` para `<WHMCS_ROOT>/includes/api/`.
+1. Copiar os três `.php` para `<WHMCS_ROOT>/includes/api/`.
 2. **Registrar no catálogo de custom actions.** As entradas já estão em
    `staycloud-frontned/whmcs/custom-actions/custom_api_register.php`
-   (`getpagarmeinstallments` / `setpagarmeinstallments`) — só falta esse hook
-   estar instalado em `<WHMCS_ROOT>/includes/hooks/custom_api_register.php` no
-   servidor. Ele só roda no hook `AdminAreaPage`, então **precisa de alguém
-   abrir qualquer página do admin do WHMCS pelo menos uma vez** depois de
-   instalado para as duas actions aparecerem no catálogo.
-3. **Liberar as duas actions no papel de API.** Toda action registrada por
+   (`getpagarmeinstallments` / `setpagarmeinstallments` / `getpagarmelasterror`)
+   — só falta esse hook estar instalado em
+   `<WHMCS_ROOT>/includes/hooks/custom_api_register.php` no servidor. Ele só
+   roda no hook `AdminAreaPage`, então **precisa de alguém abrir qualquer
+   página do admin do WHMCS pelo menos uma vez** depois de instalado para as
+   três actions aparecerem no catálogo.
+3. **Liberar as três actions no papel de API.** Toda action registrada por
    esse hook nasce com `default: 0` — ou seja, desligada em todos os papéis até
    alguém marcar manualmente. Vá em **Setup > Staff Management > API Roles**,
    abra o papel usado pelo identifier/secret dos apps, e marque
-   `GetPagarmeInstallments` e `SetPagarmeInstallments` no grupo "Custom API
-   Actions".
+   `GetPagarmeInstallments`, `SetPagarmeInstallments` e `GetPagarmeLastError`
+   no grupo "Custom API Actions".
 
 > Pular qualquer um dos passos 2 ou 3 faz a chamada retornar
 > `403 Forbidden` com corpo `{"error":"Não foi possível calcular o
 > parcelamento."}` (do lado do checkout/painel) — o arquivo `.php` sozinho em
 > `includes/api/` **não é suficiente**, mesmo estando no lugar certo.
 
-Nenhuma migração de banco é necessária: a tabela `mod_pagarme_installments` é
-criada sob demanda (módulos de gateway do WHMCS não têm hook de ativação).
+Nenhuma migração de banco é necessária: as tabelas `mod_pagarme_installments`
+e `mod_pagarme_last_error` são criadas sob demanda (módulos de gateway do
+WHMCS não têm hook de ativação).
 
 ## GetPagarmeInstallments
 
@@ -116,3 +119,56 @@ Códigos de erro: `total_mismatch`, `installments_out_of_range`,
 O registro vale ~30 min e é invalidado se a base da fatura mudar. Na captura,
 uma seleção expirada ou defasada resulta em **recusa com mensagem pedindo para
 refazer a escolha** — nunca uma cobrança silenciosa à vista.
+
+## GetPagarmeLastError
+
+Devolve o motivo, já traduzido e seguro de exibir, da última recusa de
+pagamento ou falha ao salvar cartão de um cliente. Existe porque as APIs
+nativas da WHMCS (`CapturePayment`, `AddPayMethod`) nunca repassam o
+`rawdata` que o módulo de gateway devolve — só uma mensagem genérica própria
+da WHMCS (ex: "Payment attempt failed"). O motivo real (CVV inválido, cartão
+vencido, saldo insuficiente, CPF ausente no cadastro, etc.) fica preso no
+Gateway Log, visível só para admin, a menos que o app chame esta action logo
+depois de uma falha.
+
+| Parâmetro | Obrigatório | Notas |
+|---|---|---|
+| `clientid` | sim | o cliente que acabou de ter uma tentativa recusada |
+
+```bash
+curl -s https://SEU_WHMCS/includes/api.php \
+  -d identifier=... -d secret=... -d responsetype=json \
+  -d action=GetPagarmeLastError \
+  -d clientid=42
+```
+
+Resposta quando há um motivo recente:
+
+```json
+{ "result": "success", "found": true, "code": "cvv_invalid",
+  "message": "Código de segurança (CVV) inválido ou não informado. Verifique os números no verso do cartão." }
+```
+
+Resposta quando não há nada (nenhuma tentativa falhou recentemente, ou já foi
+lida antes):
+
+```json
+{ "result": "success", "found": false }
+```
+
+**Fluxo recomendado no app**: assim que `CapturePayment`/`AddPayMethod`
+falhar, chamar `GetPagarmeLastError` com o `clientid` da tentativa e usar
+`message` (se `found: true`) no lugar da mensagem genérica; se `found: false`,
+manter o texto genérico de fallback do próprio app.
+
+**O que NUNCA volta nesta action**: o JSON cru da resposta da Pagar.me
+(pode ecoar de volta dado que o cliente digitou — endereço, nome, telefone),
+número/CVV de cartão, chaves de API, ou qualquer status HTTP interno. Só um
+`code` de uma lista fechada (ex: `cvv_invalid`, `card_expired`,
+`insufficient_funds`, `card_restricted`, `missing_document`, `invalid_field`,
+`technical_error`, `declined`) e uma `message` curta já traduzida — ver
+`pagarme_classifyDeclineReason()` em `modules/gateways/pagarme.php`.
+
+O motivo gravado vale ~2 minutos e é **apagado assim que lido uma vez** — uma
+segunda chamada logo em seguida (ex: tela recarregada) devolve `found: false`
+em vez de reexibir o mesmo motivo de uma tentativa antiga.

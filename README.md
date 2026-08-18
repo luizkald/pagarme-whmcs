@@ -245,6 +245,32 @@ widget oficial), por isso o atalho é um card na Home, não uma entrada de menu.
 Quando há pelo menos uma promoção ativa, o card mostra um selo ("N promoções ativas") — lembrete
 rápido sem precisar abrir a tela e ler a tabela inteira.
 
+## 9. Motivo do último erro de pagamento (para os apps headless)
+
+As APIs nativas da WHMCS (`CapturePayment`, `AddPayMethod`) nunca repassam o `rawdata` que
+este módulo devolve numa recusa — só uma mensagem genérica própria da WHMCS (ex: "Payment
+attempt failed"). O motivo real (CVV inválido, cartão vencido, saldo insuficiente, CPF/CNPJ
+ausente no cadastro do cliente, etc.) ficava preso no Gateway Log, visível só para admin.
+
+Desde 18/08/2026, o módulo classifica cada recusa/erro num par `(code, message)` seguro —
+`pagarme_classifyDeclineReason()` — e grava para o cliente em `mod_pagarme_last_error`
+(TTL curto, apagado ao ser lido). A custom API action `GetPagarmeLastError`
+(`includes/api/getpagarmelasterror.php`, ver `includes/api/README.md`) expõe esse motivo para
+`checkout-staycloud` e `staycloud-frontned` chamarem logo após uma falha de captura ou
+cadastro de cartão, em vez de mostrar sempre o mesmo texto genérico ao cliente.
+
+**Nunca exposto**: JSON cru da resposta da Pagar.me (pode ecoar dado que o cliente digitou —
+endereço, nome, telefone), número/CVV de cartão, chaves de API, status HTTP interno. Só um
+`code` de uma lista fechada e uma `message` curta já traduzida para PT-BR.
+
+A tabela de códigos EMV/adquirente usada na classificação (`pagarme_emvReasonMap()`) cobre os
+casos mais comuns em produção — fonte: [central de ajuda da
+Pagar.me](https://pagarme.helpjuice.com/pt_BR/p1-transa%C3%A7%C3%B5es-e-estornos/transa%C3%A7%C3%A3o-motivos-de-recusa-de-uma-transa%C3%A7%C3%A3o).
+Código não mapeado cai num fallback genérico seguro, nunca fica sem mensagem.
+
+Requer o mesmo passo de instalação das outras custom actions (registrar + liberar no papel de
+API) — ver `includes/api/README.md`.
+
 ## Observações importantes
 
 - **PCI-DSS**: como o cartão é digitado diretamente no seu site (sem tokenização

@@ -21,6 +21,9 @@ class PagarmeApi
     /** @var string|null Última mensagem de erro ocorrida */
     private $lastError;
 
+    /** @var array|null Detalhe estruturado do último erro (httpCode/message/errors) */
+    private $lastErrorDetails;
+
     public function __construct($secretKey)
     {
         // Remove espaços/quebras de linha acidentais (comum em copiar/colar),
@@ -119,6 +122,21 @@ class PagarmeApi
     }
 
     /**
+     * Retorna o detalhe estruturado do último erro, para classificação
+     * (ver pagarme_classifyDeclineReason() em pagarme.php). Diferente de
+     * getLastError() (string já formatada para o Gateway Log), isto preserva
+     * os campos originais da resposta da Pagar.me para quem precisar
+     * inspecionar `errors` por chave (ex: "card.exp_month") sem re-parsear a
+     * string concatenada.
+     *
+     * @return array|null {httpCode:int|null, message:string|null, errors:array|null}
+     */
+    public function getLastErrorDetails()
+    {
+        return $this->lastErrorDetails;
+    }
+
+    /**
      * Executa a requisição HTTP contra a API da Pagar.me
      *
      * @param string     $method  GET, POST ou DELETE
@@ -128,7 +146,8 @@ class PagarmeApi
      */
     private function request($method, $path, array $payload = null)
     {
-        $this->lastError = null;
+        $this->lastError        = null;
+        $this->lastErrorDetails = null;
 
         $ch = curl_init(self::BASE_URL . $path);
 
@@ -156,13 +175,24 @@ class PagarmeApi
         curl_close($ch);
 
         if ($curlError) {
-            $this->lastError = 'Erro de conexão com a Pagar.me: ' . $curlError;
+            $this->lastError        = 'Erro de conexão com a Pagar.me: ' . $curlError;
+            $this->lastErrorDetails = array(
+                'httpCode' => null,
+                'message'  => $this->lastError,
+                'errors'   => null,
+            );
             return false;
         }
 
         $decoded = json_decode($responseBody, true);
 
         if ($httpCode >= 400) {
+            $this->lastErrorDetails = array(
+                'httpCode' => $httpCode,
+                'message'  => isset($decoded['message']) ? $decoded['message'] : null,
+                'errors'   => isset($decoded['errors']) && is_array($decoded['errors']) ? $decoded['errors'] : null,
+            );
+
             // Erros de autenticação: mensagem orientativa sobre a Secret Key
             if ($httpCode === 401 || $httpCode === 403) {
                 $original = isset($decoded['message']) ? $decoded['message'] : $responseBody;
