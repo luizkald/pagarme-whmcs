@@ -89,6 +89,23 @@ function pagarme_config()
             'Description'  => 'Nome exato do Custom Client Field (Setup > Custom Client Fields) '
                 . 'onde o CPF/CNPJ do cliente é armazenado',
         ),
+        'axiomToken' => array(
+            'FriendlyName' => 'Axiom - Token de Ingestão',
+            'Type'         => 'password',
+            'Size'         => '60',
+            'Description'  => 'Opcional. Token de ingest do Axiom (axiom.co > Settings > API '
+                . 'Tokens). Quando preenchido, erros reais de pagamento/cadastro de cartão '
+                . '(nunca dado de cartão ou pessoal) são enviados também para o Axiom, além do '
+                . 'Gateway Log de sempre. Em branco, o comportamento é idêntico a hoje.',
+        ),
+        'axiomDataset' => array(
+            'FriendlyName' => 'Axiom - Dataset',
+            'Type'         => 'text',
+            'Size'         => '40',
+            'Default'      => 'pagarme-whmcs',
+            'Description'  => 'Nome do dataset no Axiom para onde os erros são enviados. Só tem '
+                . 'efeito se o Token de Ingestão acima estiver preenchido.',
+        ),
     );
 }
 
@@ -121,7 +138,9 @@ function pagarme_capture($params)
         pagarme_storeLastError(
             pagarme_clientIdFromParams($params),
             'technical_error',
-            'O serviço de pagamento está temporariamente indisponível. Tente novamente em alguns instantes.'
+            'O serviço de pagamento está temporariamente indisponível. Tente novamente em alguns instantes.',
+            120,
+            $params
         );
         return array(
             'status'  => 'declined',
@@ -169,7 +188,7 @@ function pagarme_capture($params)
             ), 'capture: seleção de parcelamento obsoleta');
             $installmentsStaleMsg = 'A seleção de parcelamento expirou ou os valores da fatura '
                 . 'mudaram. Refaça a escolha de parcelas antes de pagar.';
-            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'stale_installments', $installmentsStaleMsg);
+            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'stale_installments', $installmentsStaleMsg, 120, $params);
             return array(
                 'status'  => 'declined',
                 'rawdata' => $installmentsStaleMsg,
@@ -250,7 +269,7 @@ function pagarme_capture($params)
             ), 'capture: falha ao aplicar juros na fatura');
             $reconcileFailMsg = 'Não foi possível processar o parcelamento desta fatura. Tente '
                 . 'novamente em alguns instantes.';
-            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'technical_error', $reconcileFailMsg);
+            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'technical_error', $reconcileFailMsg, 120, $params);
             return array(
                 'status'  => 'declined',
                 'rawdata' => 'Não foi possível aplicar a taxa de parcelamento na fatura.',
@@ -286,7 +305,7 @@ function pagarme_capture($params)
 
         if (!$token) {
             $tokenInvalidMsg = 'Não foi possível usar este cartão salvo. Cadastre o cartão novamente.';
-            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'saved_card_invalid', $tokenInvalidMsg);
+            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'saved_card_invalid', $tokenInvalidMsg, 120, $params);
             return array(
                 'status'  => 'declined',
                 'rawdata' => 'Token de cartão salvo inválido ou corrompido.',
@@ -318,7 +337,7 @@ function pagarme_capture($params)
             ), 'capture: CVV ausente para cartão salvo em pedido novo');
 
             $cvvRequiredMsg = 'Informe o código de segurança (CVV) do cartão para concluir este pagamento.';
-            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'cvv_required', $cvvRequiredMsg);
+            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'cvv_required', $cvvRequiredMsg, 120, $params);
             return array(
                 'status'  => 'declined',
                 'rawdata' => 'CVV obrigatório para pagar com cartão salvo neste pedido.',
@@ -359,7 +378,7 @@ function pagarme_capture($params)
             // completar o próprio cadastro.
             $documentMissingMsg = 'CPF/CNPJ não encontrado no seu cadastro. Atualize seus dados '
                 . 'cadastrais antes de tentar novamente.';
-            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'missing_document', $documentMissingMsg);
+            pagarme_storeLastError(pagarme_clientIdFromParams($params), 'missing_document', $documentMissingMsg, 120, $params);
             return array(
                 'status'  => 'declined',
                 'rawdata' => 'CPF/CNPJ do cliente não encontrado. Cadastre um Custom Client Field '
@@ -400,7 +419,8 @@ function pagarme_capture($params)
         pagarme_log($params, $api->getLastError(), 'capture: falha na comunicação/validação');
         pagarme_classifyAndStore(
             array('apiError' => $api->getLastErrorDetails()),
-            pagarme_clientIdFromParams($params)
+            pagarme_clientIdFromParams($params),
+            $params
         );
         return array(
             'status'  => 'declined',
@@ -412,7 +432,7 @@ function pagarme_capture($params)
 
     if (!$charge || empty($charge['status'])) {
         pagarme_log($params, $response, 'capture: resposta sem cobrança válida');
-        pagarme_classifyAndStore(array(), pagarme_clientIdFromParams($params));
+        pagarme_classifyAndStore(array(), pagarme_clientIdFromParams($params), $params);
         return array(
             'status'  => 'declined',
             'rawdata' => $response,
@@ -494,7 +514,7 @@ function pagarme_capture($params)
             // Extrai um motivo legível da recusa quando disponível
             $motivo = pagarme_extractDeclineReason($charge);
             pagarme_log($params, $response, 'capture: recusado (' . $charge['status'] . ') ' . $motivo);
-            pagarme_classifyAndStore(array('charge' => $charge), pagarme_clientIdFromParams($params));
+            pagarme_classifyAndStore(array('charge' => $charge), pagarme_clientIdFromParams($params), $params);
             return array(
                 'status'  => 'declined',
                 'rawdata' => $response,
@@ -765,14 +785,18 @@ function pagarme_classifyDeclineReason($context)
  * pagarme_capture()/pagarme_storeremote(). Sempre retorna o par (code,
  * message) classificado, mesmo se a gravação falhar.
  *
+ * $params (opcional): repassado para pagarme_storeLastError() para também
+ * notificar o Axiom, quando configurado - ver pagarme_sendToAxiom().
+ *
  * @param array      $context  Ver pagarme_classifyDeclineReason()
  * @param int|string $clientId
+ * @param array|null $params
  * @return array{code:string, message:string}
  */
-function pagarme_classifyAndStore($context, $clientId)
+function pagarme_classifyAndStore($context, $clientId, $params = null)
 {
     $reason = pagarme_classifyDeclineReason($context);
-    pagarme_storeLastError($clientId, $reason['code'], $reason['message']);
+    pagarme_storeLastError($clientId, $reason['code'], $reason['message'], 120, $params);
     return $reason;
 }
 
@@ -852,7 +876,9 @@ function pagarme_storeremote($params)
         pagarme_storeLastError(
             pagarme_clientIdFromParams($params),
             'technical_error',
-            'O serviço de pagamento está temporariamente indisponível. Tente novamente em alguns instantes.'
+            'O serviço de pagamento está temporariamente indisponível. Tente novamente em alguns instantes.',
+            120,
+            $params
         );
         return array(
             'status'  => 'declined',
@@ -882,7 +908,9 @@ function pagarme_storeremote($params)
             pagarme_clientIdFromParams($params),
             'missing_document',
             'CPF/CNPJ não encontrado no seu cadastro. Atualize seus dados cadastrais antes de '
-                . 'salvar um cartão.'
+                . 'salvar um cartão.',
+            120,
+            $params
         );
         return array(
             'status'  => 'declined',
@@ -903,7 +931,8 @@ function pagarme_storeremote($params)
         pagarme_log($params, $err, 'storeremote: falha ao criar cliente');
         pagarme_classifyAndStore(
             array('apiError' => $api->getLastErrorDetails()),
-            pagarme_clientIdFromParams($params)
+            pagarme_clientIdFromParams($params),
+            $params
         );
         return array(
             'status'  => 'declined',
@@ -923,7 +952,9 @@ function pagarme_storeremote($params)
         pagarme_storeLastError(
             pagarme_clientIdFromParams($params),
             'cvv_required',
-            'Informe o código de segurança (CVV) para salvar este cartão.'
+            'Informe o código de segurança (CVV) para salvar este cartão.',
+            120,
+            $params
         );
         return array(
             'status'  => 'declined',
@@ -944,7 +975,8 @@ function pagarme_storeremote($params)
         pagarme_log($params, $err, 'storeremote: falha ao salvar cartão');
         pagarme_classifyAndStore(
             array('apiError' => $api->getLastErrorDetails()),
-            pagarme_clientIdFromParams($params)
+            pagarme_clientIdFromParams($params),
+            $params
         );
         return array(
             'status'  => 'declined',

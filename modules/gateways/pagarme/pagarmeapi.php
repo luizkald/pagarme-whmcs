@@ -15,6 +15,18 @@ class PagarmeApi
 {
     const BASE_URL = 'https://api.pagar.me/core/v5';
 
+    // Timeout por chamada cURL individual. pagarme_storeremote() faz DUAS
+    // chamadas sequenciais (createCustomer + createCard) numa única
+    // requisição PHP - com 30s cada, o pior caso passava de 60s e estourava
+    // o timeout de origem/proxy (Cloudflare 502 "Host Error" observado em
+    // produção em 18/08/2026, requisição nunca terminou de processar do
+    // lado do cliente, mesmo com o cURL eventualmente concluindo do lado do
+    // servidor). 15s por chamada mantém o pior caso de storeremote em ~30s,
+    // dentro de limites típicos de PHP-FPM/proxy, e devolve uma recusa clara
+    // em vez de deixar o cliente esperando quase um minuto por um 502 sem
+    // explicação.
+    const REQUEST_TIMEOUT = 15;
+
     /** @var string Secret Key (produção ou sandbox) */
     private $secretKey;
 
@@ -160,7 +172,7 @@ class PagarmeApi
         // Basic Auth: Secret Key como usuário, senha em branco
         curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
         curl_setopt($ch, CURLOPT_USERPWD, $this->secretKey . ':');
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_TIMEOUT, self::REQUEST_TIMEOUT);
         curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);

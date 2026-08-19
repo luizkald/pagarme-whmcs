@@ -896,30 +896,122 @@ function pagarme_ensureLastErrorTable()
  * GetPagarmeLastError. Best-effort: uma falha aqui nunca deve interromper o
  * fluxo de pagamento que já retornou 'declined' para o WHMCS.
  *
+ * $params (opcional): quando informado e tiver 'axiomToken' preenchido
+ * (Setup > Payments > Pagar.me), também envia o mesmo motivo para o Axiom -
+ * ver pagarme_sendToAxiom(). Sem $params, ou sem token configurado, só grava
+ * a tabela local (comportamento idêntico a antes do Axiom existir).
+ *
  * @param int|string $clientId
  * @param string     $code
  * @param string     $message
  * @param int        $ttlSeconds
+ * @param array|null $params
  * @return void
  */
-function pagarme_storeLastError($clientId, $code, $message, $ttlSeconds = 120)
+function pagarme_storeLastError($clientId, $code, $message, $ttlSeconds = 120, $params = null)
 {
     $clientId = (int) $clientId;
-    if ($clientId <= 0 || !pagarme_ensureLastErrorTable()) {
+
+    if ($clientId > 0 && pagarme_ensureLastErrorTable()) {
+        try {
+            \WHMCS\Database\Capsule::table('mod_pagarme_last_error')->updateOrInsert(
+                array('clientid' => $clientId),
+                array(
+                    'code'       => substr((string) $code, 0, 40),
+                    'message'    => substr((string) $message, 0, 500),
+                    'expires_at' => date('Y-m-d H:i:s', time() + $ttlSeconds),
+                )
+            );
+        } catch (\Exception $e) {
+            // Best-effort - nunca interrompe o fluxo de pagamento.
+        }
+    }
+
+    if (is_array($params)) {
+        pagarme_sendToAxiom($params, $clientId, $code, $message);
+    }
+}
+
+/**
+ * Envia um evento de erro para o Axiom (axiom.co), quando o admin configurou
+ * um token de ingestão no módulo (Setup > Payments > Pagar.me > "Axiom -
+ * Token de Ingestão"). Existe porque o Gateway Log da WHMCS (destino padrão
+ * de pagarme_log()) só é visível para admin dentro da WHMCS, sem alerta
+ * algum - erros de pagamento passavam despercebidos até alguém abrir a tela
+ * manualmente. O Axiom permite consultar/alertar esses erros de fora da
+ * WHMCS (ex: um monitor mandando aviso no Discord).
+ *
+ * Nunca inclui dado de cartão, CPF/CNPJ ou qualquer dado pessoal bruto - só
+ * o (code, message) já classificado por pagarme_classifyDeclineReason(),
+ * mesmo texto seguro que vai para GetPagarmeLastError, mais um punhado de
+ * IDs não-sensíveis (invoiceid, clientid, gateway) para permitir localizar
+ * o caso no admin da WHMCS depois.
+ *
+ * Best-effort e não-bloqueante por design: timeout de conexão bem curto
+ * (2s) e nenhuma exceção sobe daqui - uma falha ao notificar o Axiom NUNCA
+ * pode atrasar ou derrubar uma tentativa de pagamento real. Roda de forma
+ * síncrona (não há fila/worker neste módulo), então o timeout curto é a
+ * única proteção contra atraso - deliberadamente mais agressivo que os 15s
+ * usados nas chamadas à Pagar.me, porque isto é telemetria, não a operação
+ * principal.
+ *
+ * @param array      $params
+ * @param int|string $clientId
+ * @param string     $code
+ * @param string     $message
+ * @return void
+ */
+function pagarme_sendToAxiom($params, $clientId, $code, $message)
+{
+    $token = isset($params['axiomToken']) ? trim((string) $params['axiomToken']) : '';
+    if ($token === '') {
         return;
     }
 
+    $dataset = isset($params['axiomDataset']) && trim((string) $params['axiomDataset']) !== ''
+        ? trim((string) $params['axiomDataset'])
+        : 'pagarme-whmcs';
+
+    $event = array(
+        '_time'      => gmdate('Y-m-d\TH:i:s\Z'),
+        'level'      => 'error',
+        'code'       => (string) $code,
+        'message'    => (string) $message,
+        'clientid'   => (int) $clientId,
+        'invoiceid'  => isset($params['invoiceid']) ? (string) $params['invoiceid'] : null,
+        'gateway'    => isset($params['gatewayid']) ? 'saved_card' : 'typed_card',
+        'test_mode'  => isset($params['testMode']) && $params['testMode'] == 'on',
+        'source'     => 'pagarme-whmcs',
+    );
+
+    $payload = json_encode(array($event));
+    if ($payload === false) {
+        return;
+    }
+
+    // Formato "legacy" (não-edge) da API REST: /v1/datasets/{dataset}/ingest.
+    // O formato /v1/ingest/{dataset} só existe para chamadas via edge domain
+    // (não usado aqui - PHP puro fala direto com api.axiom.co).
+    $url = 'https://api.axiom.co/v1/datasets/' . rawurlencode($dataset) . '/ingest';
+
     try {
-        \WHMCS\Database\Capsule::table('mod_pagarme_last_error')->updateOrInsert(
-            array('clientid' => $clientId),
-            array(
-                'code'       => substr((string) $code, 0, 40),
-                'message'    => substr((string) $message, 0, 500),
-                'expires_at' => date('Y-m-d H:i:s', time() + $ttlSeconds),
-            )
-        );
-    } catch (\Exception $e) {
-        // Best-effort - nunca interrompe o fluxo de pagamento.
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+            'Authorization: Bearer ' . $token,
+            'Content-Type: application/json',
+        ));
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        // Timeouts curtos de propósito - ver docblock acima.
+        curl_setopt($ch, CURLOPT_TIMEOUT, 3);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
+        curl_exec($ch);
+        curl_close($ch);
+    } catch (\Throwable $e) {
+        // Best-effort - telemetria nunca pode derrubar um pagamento.
     }
 }
 

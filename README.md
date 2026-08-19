@@ -288,6 +288,35 @@ vai dentro do próprio token (`gatewayid`, formato `customer_id|card_id|brand|to
 tabela nova, sem estado extra a limpar. Cartões salvos de sessões anteriores (sem o carimbo
 recente, incluindo todo token gerado antes desta mudança) continuam exigindo CVV normalmente.
 
+## 11. Observabilidade externa (Axiom)
+
+Todo erro real de pagamento/cadastro de cartão (o mesmo (code, message) já classificado que
+alimenta `GetPagarmeLastError` — ver seção 9) pode ser enviado também para o
+[Axiom](https://axiom.co), fora do Gateway Log da WHMCS. Existe porque o Gateway Log só é
+visível para quem abre a tela do admin manualmente — nenhum alerta é disparado quando um
+pagamento falha silenciosamente. Com o Axiom (e um Monitor configurado lá, por exemplo mandando
+aviso para um canal do Discord), a equipe descobre a falha no momento em que ela acontece, sem
+precisar de alguém checando o WHMCS.
+
+**Configuração** (Setup > Payments > Payment Gateways > Pagar.me - Cartão de Crédito):
+- **Axiom - Token de Ingestão**: token com escopo de `ingest` (axiom.co > Settings > API
+  Tokens). Pode ser o MESMO token usado nos dois apps SvelteKit (`checkout-staycloud`,
+  `staycloud-frontned`) — o token de ingest não precisa ser exclusivo por dataset.
+- **Axiom - Dataset**: nome do dataset deste módulo especificamente (recomendado:
+  `pagarme-whmcs`, distinto dos datasets dos dois apps).
+
+**Deixar os dois campos em branco desliga completamente** — nenhuma chamada extra é feita,
+comportamento idêntico a antes desta seção existir.
+
+**O que é enviado**: `code`, `message` (o texto já traduzido/seguro, nunca o JSON cru da
+Pagar.me), `clientid`, `invoiceid`, se o cartão era salvo ou digitado, e se estava em modo de
+teste. **Nunca** número de cartão, CVV, CPF/CNPJ, endereço ou qualquer dado pessoal bruto.
+
+**Não-bloqueante**: a chamada ao Axiom usa timeout de conexão de 2s / total de 3s e nunca lança
+exceção — na pior hipótese (Axiom fora do ar), adiciona no máximo ~3s à resposta de um pagamento
+já recusado, nunca derruba nem atrasa uma captura que teria dado certo. Ver
+`pagarme_sendToAxiom()` em `modules/gateways/pagarme/installments.php`.
+
 ## Observações importantes
 
 - **PCI-DSS**: como o cartão é digitado diretamente no seu site (sem tokenização
