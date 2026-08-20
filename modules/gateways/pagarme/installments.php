@@ -908,7 +908,7 @@ function pagarme_ensureLastErrorTable()
  * @param array|null $params
  * @return void
  */
-function pagarme_storeLastError($clientId, $code, $message, $ttlSeconds = 120, $params = null)
+function pagarme_storeLastError($clientId, $code, $message, $ttlSeconds = 120, $params = null, $rawCode = null)
 {
     $clientId = (int) $clientId;
 
@@ -928,7 +928,7 @@ function pagarme_storeLastError($clientId, $code, $message, $ttlSeconds = 120, $
     }
 
     if (is_array($params)) {
-        pagarme_sendToAxiom($params, $clientId, $code, $message);
+        pagarme_sendToAxiom($params, $clientId, $code, $message, $rawCode);
     }
 }
 
@@ -959,9 +959,12 @@ function pagarme_storeLastError($clientId, $code, $message, $ttlSeconds = 120, $
  * @param int|string $clientId
  * @param string     $code
  * @param string     $message
+ * @param string|null $rawCode Código de retorno EMV bruto (ex: "1061"), quando
+ *                             disponível - ver pagarme_extractEmvCode(). Só
+ *                             para telemetria; nunca substitui $code.
  * @return void
  */
-function pagarme_sendToAxiom($params, $clientId, $code, $message)
+function pagarme_sendToAxiom($params, $clientId, $code, $message, $rawCode = null)
 {
     $token = isset($params['axiomToken']) ? trim((string) $params['axiomToken']) : '';
     if ($token === '') {
@@ -983,6 +986,13 @@ function pagarme_sendToAxiom($params, $clientId, $code, $message)
         'test_mode'  => isset($params['testMode']) && $params['testMode'] == 'on',
         'source'     => 'pagarme-whmcs',
     );
+
+    // Só inclui a chave quando há um código EMV bruto de verdade - evita
+    // poluir todo evento (a maioria não tem, ex: CVV ausente, CPF ausente)
+    // com um campo sempre null.
+    if ($rawCode !== null && $rawCode !== '') {
+        $event['raw_code'] = (string) $rawCode;
+    }
 
     $payload = json_encode(array($event));
     if ($payload === false) {

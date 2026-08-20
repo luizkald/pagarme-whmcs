@@ -580,14 +580,32 @@ function pagarme_emvReasonMap()
         . 'contato com seu banco.';
     $timeout = 'O banco emissor não respondeu a tempo. Tente novamente em alguns instantes.';
     $erroTecnico = 'Não foi possível processar o pagamento no momento. Tente novamente.';
+    // Emissor recusou por incompatibilidade de modalidade/tipo de transação
+    // (ex: cartão não habilitado para essa forma de cobrança) - distinto de
+    // "recusado", já que trocar de cartão tem mais chance de resolver do que
+    // tentar de novo com o mesmo.
+    $naoSuportado = 'Transação não suportada por este cartão/banco emissor. Tente outro cartão ou '
+        . 'entre em contato com seu banco.';
 
     $map = array(
         // Recusa genérica / banco
         '1000' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '1003' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '1005' => array('code' => 'not_authorized', 'message' => $contateBanco),
         '1007' => array('code' => 'not_authorized', 'message' => $contateBanco),
         '1008' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '1011' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '1018' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '1019' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '1049' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '1050' => array('code' => 'not_authorized', 'message' => $contateBanco),
         '2000' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '2003' => array('code' => 'not_authorized', 'message' => $contateBanco),
+        '2005' => array('code' => 'not_authorized', 'message' => $contateBanco),
         '5093' => array('code' => 'not_authorized', 'message' => $contateBanco),
+
+        // Modalidade/tipo de transação não suportado pelo emissor
+        '1061' => array('code' => 'not_supported', 'message' => $naoSuportado),
 
         // Cartão vencido
         '1001' => array('code' => 'card_expired', 'message' => $cartaoVencido),
@@ -598,15 +616,22 @@ function pagarme_emvReasonMap()
         '1022' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
         '1024' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
         '1029' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
+        '1031' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
         '2002' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
         '2010' => array('code' => 'security_declined', 'message' => $suspeitaFraude),
 
-        // Cartão com restrição / bloqueado
+        // Cartão com restrição / bloqueado / conta encerrada
         '1004' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
         '1025' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
         '1032' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
         '1035' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '1036' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '1037' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '1038' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '1039' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
         '1040' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '1041' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
+        '1042' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
         '2004' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
         '2007' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
         '2008' => array('code' => 'card_restricted', 'message' => $cartaoRestrito),
@@ -796,8 +821,47 @@ function pagarme_classifyDeclineReason($context)
 function pagarme_classifyAndStore($context, $clientId, $params = null)
 {
     $reason = pagarme_classifyDeclineReason($context);
-    pagarme_storeLastError($clientId, $reason['code'], $reason['message'], 120, $params);
+    // Código EMV bruto (ex: "1061"), quando disponível - só para telemetria
+    // (Axiom/Discord). Nunca decide a mensagem mostrada ao cliente (isso é
+    // sempre pagarme_classifyDeclineReason(), acima); serve só para o admin
+    // identificar rapidamente um código ainda não mapeado em
+    // pagarme_emvReasonMap() sem precisar abrir o Gateway Log.
+    $rawCode = pagarme_extractEmvCode($context);
+    pagarme_storeLastError($clientId, $reason['code'], $reason['message'], 120, $params, $rawCode);
     return $reason;
+}
+
+/**
+ * Extrai o código de retorno EMV bruto de um contexto de recusa, quando
+ * disponível. Mesma extração usada dentro de pagarme_classifyDeclineReason()
+ * (acquirer_return_code, com fallback para gateway_response.code) - mantida
+ * separada e chamada independentemente para não misturar "qual código foi
+ * visto" com "qual mensagem foi decidida".
+ *
+ * @param array $context Ver pagarme_classifyDeclineReason()
+ * @return string|null
+ */
+function pagarme_extractEmvCode($context)
+{
+    if (empty($context['charge'])) {
+        return null;
+    }
+
+    $lt = isset($context['charge']['last_transaction']) ? $context['charge']['last_transaction'] : array();
+
+    foreach (array('acquirer_return_code', 'gateway_response') as $key) {
+        if (!empty($lt[$key])) {
+            $value = $lt[$key];
+            if (is_array($value) && !empty($value['code'])) {
+                return (string) $value['code'];
+            }
+            if (!is_array($value)) {
+                return (string) $value;
+            }
+        }
+    }
+
+    return null;
 }
 
 /**
