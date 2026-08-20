@@ -921,6 +921,14 @@ function pagarme_storeremote($params)
     $api        = new PagarmeApi($secretKey);
     $holderName = pagarme_getHolderName($params);
 
+    // Checkpoint ANTES de cada chamada cURL bloqueante (não só no catch/erro):
+    // se o Cloudflare cortar a conexão no meio de storeremote (visto em
+    // produção em 19/08/2026, ~8-10s no total das duas chamadas), o PHP pode
+    // nunca terminar de executar esta função - o Gateway Log só grava em
+    // pagarme_log() explícito, então sem este checkpoint não há NENHUM
+    // registro de que a requisição chegou a sair do WHMCS rumo à Pagar.me.
+    pagarme_log($params, array('customerId' => null), 'storeremote: chamando createCustomer (1/2)');
+
     // 1. Cria (ou recria) o cliente na Pagar.me
     $customer = $api->createCustomer(
         pagarme_buildCustomerPayload($params, $document, $holderName)
@@ -961,6 +969,8 @@ function pagarme_storeremote($params)
             'rawdata' => $reason,
         );
     }
+
+    pagarme_log($params, array('customerId' => $customer['id']), 'storeremote: chamando createCard (2/2)');
 
     $card = $api->createCard($customer['id'], array(
         'number'      => preg_replace('/\D/', '', $params['cardnum']),
